@@ -28,10 +28,13 @@ from petsc4py import PETSc
 
 from xii.assembler.ufl_utils import *
 from xii.linalg.matrix_utils import is_number
-
+'''
 from ufl.corealg.traversal import traverse_unique_terminals
 import dolfin as df
 import ufl
+
+'''
+
 
 
 #parametri: termine reazione nel 3D: si 
@@ -74,14 +77,11 @@ def get_mesh(n, coupling_radius, path_to_1Dmesh):
     
     #LOADING NETWORK XDMF 1D MESH AND ITS TAGS (each mesh function must be saved in different files)
     meshQ = Mesh()
-    print(f'{path_to_1Dmesh}.xdmf')
     with XDMFFile(f'{path_to_1Dmesh}marked_mesh.xdmf') as infile:
+        infile.read(meshQ)
 
-         infile.read(meshQ)
-    print(f'{path_to_1Dmesh}markers.xdmf') 
-    Q_markers = MeshFunction('size_t', meshQ , 0)
-  
-    xdmf_file = XDMFFile(f'{path_to_1Dmesh}markers.xdmf')  
+    Q_markers = MeshFunction('size_t', meshQ, 0)
+    xdmf_file = XDMFFile(f'{path_to_1Dmesh}markers.xdmf') 
     
     xdmf_file.read(Q_markers)
     xdmf_file.close()
@@ -230,8 +230,10 @@ def solve_haznics(W, A, b, AD, M, C):
 
     # call solver
     niters = haznics.fenics_metric_amg_solver(Ahaz, bhaz, xhaz, ADhaz, Mhaz, Chaz)
-
-    return niters, xhaz
+     # Extract solution as numpy array
+    haznics.dvec_write('/tmp/solution_raw.dat', xhaz)
+    x_np = np.loadtxt('/tmp/solution_raw.dat', skiprows=1)
+    return niters, xhaz, x_np
 
 
 
@@ -307,7 +309,7 @@ if __name__ == '__main__':
     nn = args.nnn
 
     #path_to_mats   = f"./FOM/mats/{name}_"
-    path_to_1Dmesh = f'./{which}_NETs/{mesh_name}_'
+    path_to_1Dmesh = f'./nets/{which}/mynet__'
 
     #--------------------------------------------------------------------
 
@@ -323,7 +325,7 @@ if __name__ == '__main__':
 
     # Now solving Solve(CG + AMG)
     start        = time.time()
-    niters, xhaz = solve_haznics(W, A, b, AD, M, C)
+    niters, xhaz, x_np = solve_haznics(W, A, b, AD, M, C)
     end          = time.time()
     print("solving elapsed time", end - start)
     HAZ_time = end - start
@@ -336,6 +338,20 @@ if __name__ == '__main__':
     print(f'dim(V)={dimV} dim(Q)={dimQ}  hmax(V)={W[0].mesh().hmax():.2f}  hmin(V)={W[0].mesh().hmin():.2f}  hmin(Q)={W[1].mesh().hmin():.2f} '
           f'niters={niters}')
     print("************************")
+
+    import os
+    sol_folder = f'./solution/mesh{mesh_name}_rad{radius}_n{nn}'
+    os.makedirs(sol_folder, exist_ok=True)
+
+    # numpy save
+   
+    np.save(f'{sol_folder}/solution.npy', x_np)
+
+    dimV, dimQ = W[0].dim(), W[1].dim()
+    u3d = Function(W[0])
+    u1d = Function(W[1])
+    u3d.vector()[:] = x_np[:dimV]
+    u1d.vector()[:] = x_np[dimV:]
  
     #import pdb; pdb.set_trace() 
 
@@ -394,7 +410,7 @@ if __name__ == '__main__':
     # SOLVE!
     ksp.solve(b_PET, u_PET)
      
-    #----------------------------------------------------------------------   
+    #----------------------------------------------------------------------
 
 
 

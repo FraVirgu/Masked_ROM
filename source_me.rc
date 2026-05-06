@@ -1,0 +1,10 @@
+conda deactivate &&
+conda activate fenics-env &&
+cd hazmath && 
+make install && 
+cd examples/haznics && 
+source setup.rc && 
+cd .. &&
+cd .. &&
+cd .. &&
+grep -rl "ufl_legacy" /home/francesco-virgulti/miniconda3/envs/fenics-env/lib/python3.10/site-packages/xii/ | xargs sed -i 's/ufl_legacy/ufl/g'
