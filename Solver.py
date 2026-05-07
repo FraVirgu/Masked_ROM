@@ -206,30 +206,6 @@ class Solver3D1D:
         self.d_omega = Measure("dx", domain=self.meshV,
                                             subdomain_data=self.V_cell_markers)
 
-        # MARKET dim=2 => facets
-        # create facet markers from cell markers for Dirichlet BCs (Nitsche)
-        self.meshV.init(2, 3)
-        facet_markers = MeshFunction("size_t", self.meshV, 2, 222)
-
-        for facet in facets(self.meshV):
-            adj = facet.entities(3)
-
-            if len(adj) == 1:
-                # OUTER BOX SKIN ONLY — check which region it belongs to
-                if self.V_cell_markers[adj[0]] == 111:
-                    facet_markers[facet] = 111
-
-            else:  # len(adj) == 2 — all interior facets
-                t0 = self.V_cell_markers[adj[0]]
-                t1 = self.V_cell_markers[adj[1]]
-                if t0 == 111 and t1 == 111:
-                    facet_markers[facet] = 111        # buried in outside
-                elif t0 != t1:
-                    facet_markers[facet] = 333        # interface
-
-        self.facet_markers = facet_markers
-        
-        
         
         # 1D mesh
         self.meshQ = Mesh()
@@ -331,7 +307,6 @@ class Solver3D1D:
         self.A  = self.AD + self.gamma * self.M
 
         self.C = csr_matrix(C_mat.getValuesCSR()[::-1], shape=C_mat.size)
-        self.bc_outside = DirichletBC(V, Constant(0.0), self.facet_markers, 111)
         
 
         print("System assembled.")
