@@ -1,7 +1,7 @@
 Running :
-python3 HAZ_MONOLITIC_SOLVER.py -rad 0.05 -mesh 1 -nnn 10 -which test1
+python3 Solver.py -rad 0.05 -mesh 1 -nnn 10 -which SubDomain
 
-python3 NET_GEN.py -name net01 -test case_A -inlet 5 -outlet 3
+python3 Domain.py -name net01 -test SubDomain -inlet 5 -outlet 3
 
 Codes for 1D graph generation and solution of 3D-1D coupled problem. The purpose is the generation of a "masked" FOM for the training of 3D-1D "masked" ROM.
 

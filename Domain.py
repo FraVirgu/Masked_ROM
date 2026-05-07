@@ -548,24 +548,6 @@ class Domain:
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -576,9 +558,9 @@ parser.add_argument("-outlet", type=int)
 args, _ = parser.parse_known_args()
 
 boundary = Boundary(
-    lambda x, y, z: (0.0 <= x <= 1.0 and
-                     0.0 <= y <= 1.0 and
-                     0.0 <= z <= 0.5)
+    lambda x, y, z: (-1.0 <= x <= 1.0 and
+                      -1.0 <= y <= 1.0 and
+                     -0.5 <= z <= 0.0)
 )
 
 domain = Domain(

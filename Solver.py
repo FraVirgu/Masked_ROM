@@ -8,7 +8,18 @@ from xii.assembler.average_matrix import average_matrix as average_3d1d_matrix, 
 from block.algebraic.hazmath import block_mat_to_block_dCSRmat
 from petsc4py import PETSc
 import haznics
+from Boundary import Boundary
+from dolfin import SubDomain
 
+class FEniCSBoundaryWrapper(SubDomain):
+    def __init__(self, boundary_obj):
+        super().__init__()
+        self._b = boundary_obj
+
+    def inside(self, x, on_boundary):
+        # on_boundary: True = outer skin of the BoxMesh
+        # self._b(x):  True = inside your domain
+        return on_boundary and self._b([x[0], x[1], x[2]])
 
 class Solver3D1D:
     """
@@ -30,6 +41,7 @@ class Solver3D1D:
         kappa: float         = 1.0,
         beta_nitsche: float  = 5.0,
         inlet_tag: int       = 111,
+        boundary: Boundary | None = None,
     ):
         # --- parameters ---
         self.path_to_1D_mesh  = path_to_1D_mesh
@@ -42,11 +54,12 @@ class Solver3D1D:
         self.gamma            = kappa * 2 * np.pi * coupling_radius   # coupling strength
         self.beta_nitsche     = beta_nitsche
         self.inlet_tag        = inlet_tag
-
+        self.boundary         = boundary
         # --- derived (populated by build() / solve()) ---
         self.meshV      = None   # 3D mesh
         self.meshQ      = None   # 1D mesh
         self.Q_markers  = None   # FIX 2: keep Q_markers alive on self
+        self.V_markers = None 
         self.ds         = None   # boundary measure on 1D
         self.W          = None   # [V, Q] function spaces
         self.AD         = None   # diffusion block matrix
@@ -124,6 +137,40 @@ class Solver3D1D:
             dist.vector()[i] = np.linalg.norm(coord - close_p)
         return dist
 
+    def save_paraview(self, output_folder: str):
+        """Save 3D and 1D solutions + mesh markers for ParaView visualization."""
+        self._require("u3d", "u1d", "meshV", "meshQ")
+        os.makedirs(output_folder, exist_ok=True)
+
+        # ── 3D solution ───────────────────────────────────────────────
+        with XDMFFile(f"{output_folder}/u3d.xdmf") as f:
+            f.parameters["flush_output"]          = True
+            f.parameters["functions_share_mesh"]  = True
+            self.u3d.rename("u3d", "3D pressure")
+            f.write(self.u3d)
+
+        # ── 1D solution ───────────────────────────────────────────────
+        with XDMFFile(f"{output_folder}/u1d.xdmf") as f:
+            f.parameters["flush_output"]          = True
+            f.parameters["functions_share_mesh"]  = True
+            self.u1d.rename("u1d", "1D vessel pressure")
+            f.write(self.u1d)
+
+        # ── 3D cell markers (inside=222 / outside=111) ────────────────
+        with XDMFFile(f"{output_folder}/cell_markers.xdmf") as f:
+            f.parameters["flush_output"] = True
+            f.write(self.V_cell_markers)
+
+        # ── 1D vertex markers (inlet=111 / bulk=555 / outlet=999) ─────
+        with XDMFFile(f"{output_folder}/vessel_markers.xdmf") as f:
+            f.parameters["flush_output"] = True
+            f.write(self.Q_markers)
+
+        print(f"ParaView files saved → {output_folder}/")
+        print(f"  u3d.xdmf          — 3D pressure field")
+        print(f"  u1d.xdmf          — 1D vessel pressure")
+        print(f"  cell_markers.xdmf — inside/outside regions")
+        print(f"  vessel_markers.xdmf — inlet/bulk/outlet tags")
     # =========================================================================
     # Private build steps
     # =========================================================================
@@ -135,8 +182,55 @@ class Solver3D1D:
         r          = self.max_radius
         inf_pt     = Point(-1 - 1.1*r, -1 - 1.1*r, -1 - 1.1*r)
         max_pt     = Point( 1 + 1.1*r,  1 + 1.1*r,  1 + 1.1*r)
+        self.boundary = Boundary(
+            lambda x, y, z: (-1.0 - 1.1*r <= x <= 1.0 + 1.1*r and
+                            -1.0 - 1.1*r <= y <= 1.0 + 1.1*r and
+                            -0.5 - 0.51*r <= z <= 0.0 + 0.1*r)
+            )
         self.meshV = BoxMesh(inf_pt, max_pt, self.n, self.n, self.n)
+        
+        
 
+        # MARKET dim=3 => cells (tetrahedra)       
+        # Seperate the cell inside the subdomain (anatomical domain) from the cell outside the subdomain (outside anatomical domain)
+        
+        self.V_cell_markers = MeshFunction("size_t", self.meshV, 3, 222)
+        for cell in cells(self.meshV):
+            mp = cell.midpoint()
+            point = [mp.x(), mp.y(), mp.z()]
+            if self.boundary is not None and self.boundary(point):
+                self.V_cell_markers[cell] = 222   # inside anatomical domain
+            else:
+                self.V_cell_markers[cell] = 111   # outside anatomical domain
+        
+        self.d_omega = Measure("dx", domain=self.meshV,
+                                            subdomain_data=self.V_cell_markers)
+
+        # MARKET dim=2 => facets
+        # create facet markers from cell markers for Dirichlet BCs (Nitsche)
+        self.meshV.init(2, 3)
+        facet_markers = MeshFunction("size_t", self.meshV, 2, 222)
+
+        for facet in facets(self.meshV):
+            adj = facet.entities(3)
+
+            if len(adj) == 1:
+                # OUTER BOX SKIN ONLY — check which region it belongs to
+                if self.V_cell_markers[adj[0]] == 111:
+                    facet_markers[facet] = 111
+
+            else:  # len(adj) == 2 — all interior facets
+                t0 = self.V_cell_markers[adj[0]]
+                t1 = self.V_cell_markers[adj[1]]
+                if t0 == 111 and t1 == 111:
+                    facet_markers[facet] = 111        # buried in outside
+                elif t0 != t1:
+                    facet_markers[facet] = 333        # interface
+
+        self.facet_markers = facet_markers
+        
+        
+        
         # 1D mesh
         self.meshQ = Mesh()
         with XDMFFile(f"{self.path_to_1D_mesh}marked_mesh.xdmf") as f:
@@ -182,11 +276,17 @@ class Solver3D1D:
 
         dx_  = Measure("dx", domain=self.meshQ)
         ds   = self.ds
+        d_omega = self.d_omega
+        tag_outside = 111   # cells outside your anatomical domain
         tag  = self.inlet_tag
 
         k3   = Constant(self.sigma3d)
         k1   = Constant(self.sigma1d)
         beta = Constant(self.beta_nitsche)
+
+        # Dirichlet BCs on the 3d Mesh for the outside region (tag 111) using Nitsche's method
+        u_outside = Constant(0.0)   # change this to any value you want
+        PENALTY = Constant(1e10)
 
         # Nitsche parameters
         h_E   = MaxCellEdgeLength(self.meshQ)
@@ -195,13 +295,19 @@ class Solver3D1D:
 
         # --- stiffness block (AD) ---
         a = block_form(self.W, 2)
-        a[0][0] = k3 * inner(grad(u), grad(v)) * dx + k3 * inner(u, v) * dx
-        a[1][1] = (
-              k1 * inner(grad(p), grad(q)) * dx
-            - inner(dot(grad(p), n_fct), q) * ds(tag, domain=self.meshQ)
-            - inner(p, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
-            + beta * (h_E**-1) * inner(p, q) * ds(tag, domain=self.meshQ)
+        
+        a[0][0] = (
+            k3 * inner(grad(u), grad(v)) * self.d_omega(222)   # PDE inside
+            + k3 * inner(u, v)             * self.d_omega(222)
+            + PENALTY * inner(u, v)        * self.d_omega(111)   # penalty outside
         )
+
+        a[1][1] = (
+                    k1 * inner(grad(p), grad(q)) * dx
+                    - inner(dot(grad(p), n_fct), q) * ds(tag, domain=self.meshQ)
+                    - inner(p, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
+                    + beta * (h_E**-1) * inner(p, q) * ds(tag, domain=self.meshQ)
+                )
 
         # --- coupling block (M) ---
         m = block_form(self.W, 2)
@@ -212,7 +318,10 @@ class Solver3D1D:
 
         # --- rhs (L) ---
         L = block_form(self.W, 1)
-        L[0] = inner(Constant(0), v) * dx
+        L[0] = (
+            inner(Constant(0), v)      * self.d_omega(222)     # zero source inside
+            + PENALTY * inner(u_outside, v) * self.d_omega(111)  # prescribed value outside
+        )
         L[1] = (
             - inner(p_in, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
             + beta * (h_E**-1) * inner(p_in, q) * ds(tag, domain=self.meshQ)
@@ -222,6 +331,9 @@ class Solver3D1D:
         self.A  = self.AD + self.gamma * self.M
 
         self.C = csr_matrix(C_mat.getValuesCSR()[::-1], shape=C_mat.size)
+        self.bc_outside = DirichletBC(V, Constant(0.0), self.facet_markers, 111)
+        
+
         print("System assembled.")
 
     def _split_solution(self):
@@ -325,8 +437,10 @@ if __name__ == "__main__":
         if val is None:
             raise ValueError(f"Missing required argument: -{arg}")
 
+   
+
     solver = Solver3D1D(
-        path_to_1D_mesh = f"./nets/{args.which}/mynet__",
+        path_to_1D_mesh = f"./nets/{args.which}/net01__",
         n               = args.nnn,
         max_radius      = 0.1,          # matches original fixed value
         coupling_radius = args.rad,
@@ -336,3 +450,4 @@ if __name__ == "__main__":
     ).build().solve()
 
     solver.save(f"./solution/mesh{args.mesh}_rad{args.rad}_n{args.nnn}")
+    solver.save_paraview(f"./solution/mesh{args.mesh}_rad{args.rad}_n{args.nnn}/paraview")
