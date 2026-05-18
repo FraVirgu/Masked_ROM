@@ -8,7 +8,7 @@ from xii.assembler.average_matrix import average_matrix as average_3d1d_matrix, 
 from block.algebraic.hazmath import block_mat_to_block_dCSRmat
 from petsc4py import PETSc
 import haznics
-from Boundary import Boundary
+from Boundary import Boundary,boundary
 from dolfin import SubDomain
 
 class FEniCSBoundaryWrapper(SubDomain):
@@ -182,11 +182,7 @@ class Solver3D1D:
         r          = self.max_radius
         inf_pt     = Point(-1 - 1.1*r, -1 - 1.1*r, -1 - 1.1*r)
         max_pt     = Point( 1 + 1.1*r,  1 + 1.1*r,  1 + 1.1*r)
-        self.boundary = Boundary(
-            lambda x, y, z: (-1.0 - 1.1*r <= x <= 1.0 + 1.1*r and
-                            -1.0 - 1.1*r <= y <= 1.0 + 1.1*r and
-                            -0.5 - 0.51*r <= z <= 0.0 + 0.1*r)
-            )
+        self.boundary = boundary
         self.meshV = BoxMesh(inf_pt, max_pt, self.n, self.n, self.n)
         
         

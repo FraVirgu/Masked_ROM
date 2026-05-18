@@ -6,7 +6,7 @@ from dolfin import (
     Mesh, MeshEditor, MeshFunction, File, Point, BoxMesh,
     XDMFFile, MPI, cells
 )
-from Boundary import Boundary 
+from Boundary import Boundary, boundary  # noqa: local import
 
 class Domain:
     """
@@ -78,13 +78,7 @@ class Domain:
         self.vaso_markers = None
 
         self._check_warnings()
-
-
-        self.boundary = boundary if boundary is not None else Boundary(
-            lambda x, y, z: (self.p_min[0] <= x <= self.p_max[0] and
-                             self.p_min[1] <= y <= self.p_max[1] and
-                             self.p_min[2] <= z <= self.p_max[2])
-        )
+        self.boundary = boundary
 
     # =========================================================================
     # Public API
@@ -342,12 +336,20 @@ class Domain:
         return np.dot(P, point_coords)[:3]
 
     @staticmethod
-    def _find_nearest_points(mesh, plane_coeffs, n):
+    def _find_nearest_points_plane(mesh, plane_coeffs, n):
         vertices  = mesh.coordinates()
         A, B, C, D = plane_coeffs
         distances = (np.abs(np.dot(vertices, [A, B, C]) - D)
                      / np.linalg.norm([A, B, C]))
         closest_indices = np.argsort(distances)[:n]
+        return vertices[closest_indices], closest_indices
+    
+
+    @staticmethod
+    def _find_nearest_points_vertex(mesh, vertex):
+        vertices = mesh.coordinates()
+        distances = np.linalg.norm(vertices - vertex, axis=1)
+        closest_indices = np.argsort(distances)[:1]   # ← slice, keeps array shape
         return vertices[closest_indices], closest_indices
 
     def _get_vor_edges(self, vor, vertices, shape_box, elli):
@@ -408,27 +410,45 @@ class Domain:
     def _plane_new_verts(self, mesh, planes_in, n_in, planes_out, n_out):
         """Project boundary vertices onto inlet/outlet planes and rebuild mesh with markers."""
         from xii import EmbeddedMesh, transfer_markers  # noqa: local import
-
-        li, lo   = len(planes_in), len(planes_out)
+        
         vertices = mesh.coordinates()
         nv_old   = len(vertices)
 
-        # --- collect projected vertices ---
-        proj_in  = [None] * li
-        proj_out = [None] * lo
+        if self.boundary.is_inlet_empty():
+            print("WARNING: no inlet points provided, creating based on planes_in")
+            li, lo   = len(planes_in), len(planes_out)
 
-        for pl, (pin, pout) in enumerate(zip(planes_in, planes_out)):
-            coords_in,  idx_in  = self._find_nearest_points(mesh, pin,  n_in)
-            coords_out, idx_out = self._find_nearest_points(mesh, pout, n_out)
-            proj_in[pl]  = (list(idx_in),
-                            [self._point_plane_proj(c, pin)  for c in coords_in])
-            proj_out[pl] = (list(idx_out),
-                            [self._point_plane_proj(c, pout) for c in coords_out])
+            proj_in  = [None] * li
+            proj_out = [None] * lo
+
+            for pl, (pin, pout) in enumerate(zip(planes_in, planes_out)):
+                coords_in,  idx_in  = self._find_nearest_points_plane(mesh, pin,  n_in)
+                coords_out, idx_out = self._find_nearest_points_plane(mesh, pout, n_out)
+                proj_in[pl]  = (list(idx_in),
+                                [self._point_plane_proj(c, pin)  for c in coords_in])
+                proj_out[pl] = (list(idx_out),
+                                [self._point_plane_proj(c, pout) for c in coords_out])
+
+        else:
+            print("INFO: using boundary.inlet / boundary.outlet points")
+            li = len(self.boundary.inlet)
+            lo = len(self.boundary.outlet)
+
+            proj_in  = [None] * li
+            proj_out = [None] * lo
+
+            for i, (vin, vout) in enumerate(zip(self.boundary.inlet, self.boundary.outlet)):
+                # find closest mesh vertex to each inlet/outlet point
+                _, idx_in  = self._find_nearest_points_vertex(mesh, vin)
+                _, idx_out = self._find_nearest_points_vertex(mesh, vout)
+                # the new vertex IS the inlet/outlet point itself (no plane projection)
+                proj_in[i]  = ([int(idx_in[0])],  [np.array(vin)])
+                proj_out[i] = ([int(idx_out[0])], [np.array(vout)])
 
         nv_new_in  = [len(proj_in[pl][1])  for pl in range(li)]
         nv_new_out = [len(proj_out[pl][1]) for pl in range(lo)]
 
-        # --- build new mesh ---
+        # --- build new mesh --- (unchanged below)
         ufl_cell = ufl.Cell("interval", len(vertices[0]))
         assert 1 == ufl_cell.topological_dimension()
 
@@ -557,11 +577,7 @@ parser.add_argument("-inlet",  type=int)
 parser.add_argument("-outlet", type=int)
 args, _ = parser.parse_known_args()
 
-boundary = Boundary(
-    lambda x, y, z: (-1.0 <= x <= 1.0 and
-                      -1.0 <= y <= 1.0 and
-                     -0.5 <= z <= 0.0)
-)
+
 
 domain = Domain(
     name            = f"./nets/{args.test}/{args.name}_",
