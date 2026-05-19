@@ -1,7 +1,8 @@
+from pyclbr import Function
 import time
 import os
 import numpy as np
-from scipy.sparse import csr_matrix, save_npz
+from scipy.sparse import csr_matrix, save_npz, lil_matrix
 from dolfin import *
 from xii import *
 from xii.assembler.average_matrix import average_matrix as average_3d1d_matrix, trace_3d1d_matrix
@@ -49,7 +50,8 @@ class Solver3D1D:
         self.max_radius       = max_radius                           # FIX 1: separate from coupling_radius
         self.coupling_radius  = coupling_radius
         self.sigma3d          = sigma3d
-        self.sigma1d          = sigma1d * np.pi * coupling_radius**2  # scaled 1D conductivity
+        self.sigma1d_ref = sigma1d          # raw, before R² scaling
+        self.sigma1d     = sigma1d * np.pi * coupling_radius**2
         self.kappa            = kappa
         self.gamma            = kappa * 2 * np.pi * coupling_radius   # coupling strength
         self.beta_nitsche     = beta_nitsche
@@ -203,16 +205,29 @@ class Solver3D1D:
                                             subdomain_data=self.V_cell_markers)
 
         
-        # 1D mesh
+        # 1: 1D mesh
         self.meshQ = Mesh()
         with XDMFFile(f"{self.path_to_1D_mesh}marked_mesh.xdmf") as f:
             f.read(self.meshQ)
 
-        # FIX 2: store Q_markers on self to prevent garbage collection
+        # 2: Q_markers 
         self.Q_markers = MeshFunction("size_t", self.meshQ, 0)
         xdmf_markers   = XDMFFile(f"{self.path_to_1D_mesh}markers.xdmf")
         xdmf_markers.read(self.Q_markers)
         xdmf_markers.close()
+
+        # 3: radii  (vertex function, dim=0)
+        radii_path = f"{self.path_to_1D_mesh}radii.xdmf"
+        if os.path.exists(radii_path):
+            self.Q_radii = MeshFunction("double", self.meshQ, 0)
+            xdmf_radii   = XDMFFile(radii_path)
+            xdmf_radii.read(self.Q_radii)
+            xdmf_radii.close()
+            r_arr = self.Q_radii.array()
+            print(f"Q_radii loaded: min={r_arr.min():.4f}  max={r_arr.max():.4f}")
+        else:
+            self.Q_radii = None
+            print("No radii file found — using uniform coupling_radius")
 
         self.ds = Measure("ds", domain=self.meshQ)
         self.ds = self.ds(subdomain_data=self.Q_markers)
@@ -224,89 +239,149 @@ class Solver3D1D:
         """Assemble stiffness, coupling, and rhs blocks."""
         self._require("meshV", "meshQ", "ds")
 
-        # FIX 3: instantiate TrialFunction/TestFunction directly from each space
-        # (not via map() over W list) so xii's is_terminal check passes for Average
         V          = FunctionSpace(self.meshV, "CG", 1)
         Q          = FunctionSpace(self.meshQ, "CG", 1)
         self.W     = [V, Q]
         self.V_DOF = V.dofmap().global_dimension()
         print(f"3D DOFs: {self.V_DOF}")
 
-        u, v = TrialFunction(V), TestFunction(V)   # 3D — plain terminals ✓
-        p, q = TrialFunction(Q), TestFunction(Q)   # 1D — plain terminals ✓
+        u, v = TrialFunction(V), TestFunction(V)
+        p, q = TrialFunction(Q), TestFunction(Q)
 
-        # --- coupling operator ---
-        if self.coupling_radius > 0:
-            cylinder = Circle(radius=self.coupling_radius, degree=10)
-            Ru       = Average(u, self.meshQ, cylinder)   # is_terminal passes ✓
-            Rv       = Average(v, self.meshQ, cylinder)
-            C_mat    = average_3d1d_matrix(V, Q, cylinder)
-        else:
-            Ru    = Average(u, self.meshQ, None)
-            Rv    = Average(v, self.meshQ, None)
-            C_mat = trace_3d1d_matrix(V, Q, self.meshQ)
-
-        dx_  = Measure("dx", domain=self.meshQ)
-        ds   = self.ds
-        d_omega = self.d_omega
-        tag_outside = 111   # cells outside your anatomical domain
-        tag  = self.inlet_tag
-
-        k3   = Constant(self.sigma3d)
-        k1   = Constant(self.sigma1d)
-        beta = Constant(self.beta_nitsche)
-
-        # Dirichlet BCs on the 3d Mesh for the outside region (tag 111) using Nitsche's method
-        u_outside = Constant(0.0)   # change this to any value you want
+        dx_     = Measure("dx", domain=self.meshQ)
+        ds      = self.ds
+        tag     = self.inlet_tag
+        k3      = Constant(self.sigma3d)
+        beta    = Constant(self.beta_nitsche)
+        h_E     = MaxCellEdgeLength(self.meshQ)
+        n_fct   = FacetNormal(self.meshQ)
+        p_in    = Constant(1)
+        u_out   = Constant(0.0)
         PENALTY = Constant(1e10)
 
-        # Nitsche parameters
-        h_E   = MaxCellEdgeLength(self.meshQ)
-        n_fct = FacetNormal(self.meshQ)
-        p_in  = Constant(1)   # inlet Dirichlet value
-
-        # --- stiffness block (AD) ---
         a = block_form(self.W, 2)
-        
+        m = block_form(self.W, 2)
+        L = block_form(self.W, 1)
+
+        # ── a[0][0]: 3D diffusion — identical in all branches ─────────────
         a[0][0] = (
-            k3 * inner(grad(u), grad(v)) * self.d_omega(222)   # PDE inside
+            k3 * inner(grad(u), grad(v)) * self.d_omega(222)
             + k3 * inner(u, v)             * self.d_omega(222)
-            + PENALTY * inner(u, v)        * self.d_omega(111)   # penalty outside
+            + PENALTY * inner(u, v)        * self.d_omega(111)
         )
 
-        a[1][1] = (
-                    k1 * inner(grad(p), grad(q)) * dx
-                    - inner(dot(grad(p), n_fct), q) * ds(tag, domain=self.meshQ)
-                    - inner(p, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
-                    + beta * (h_E**-1) * inner(p, q) * ds(tag, domain=self.meshQ)
-                )
-
-        # --- coupling block (M) ---
-        m = block_form(self.W, 2)
-        m[0][0] =  inner(Ru, Rv) * dx_
-        m[0][1] = -inner(p, Rv)  * dx_
-        m[1][0] = -inner(q, Ru)  * dx_
-        m[1][1] =  inner(p, q)   * dx_
-
-        # --- rhs (L) ---
-        L = block_form(self.W, 1)
+        # ── rhs — identical in all branches ───────────────────────────────
         L[0] = (
-            inner(Constant(0), v)      * self.d_omega(222)     # zero source inside
-            + PENALTY * inner(u_outside, v) * self.d_omega(111)  # prescribed value outside
+            inner(Constant(0), v) * self.d_omega(222)
+            + PENALTY * inner(u_out, v) * self.d_omega(111)
         )
         L[1] = (
             - inner(p_in, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
             + beta * (h_E**-1) * inner(p_in, q) * ds(tag, domain=self.meshQ)
         )
 
-        self.AD, self.M, self.b = map(ii_assemble, (a, m, L))
-        self.A  = self.AD + self.gamma * self.M
+        # ── Nitsche boundary terms — identical in all branches ────────────
+        nitsche = (
+            - inner(dot(grad(p), n_fct), q) * ds(tag, domain=self.meshQ)
+            - inner(p, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
+            + beta * (h_E**-1) * inner(p, q) * ds(tag, domain=self.meshQ)
+        )
 
-        self.C = csr_matrix(C_mat.getValuesCSR()[::-1], shape=C_mat.size)
-        
+        # ══════════════════════════════════════════════════════════════════
+        # BRANCH 1 — per-edge radii
+        # ══════════════════════════════════════════════════════════════════
+        if self.Q_radii is not None:
+            n_V   = V.dofmap().global_dimension()
+            n_Q   = Q.dofmap().global_dimension()
+            C_mat = lil_matrix((n_Q, n_V))
+
+            forms_00, forms_01, forms_10, forms_11, forms_a11 = [], [], [], [], []
+
+            # one MeshFunction, unique tag per edge — same subdomain_data
+            # object across all dx_i so UFL accepts sum(forms) ✓
+            cell_marker = MeshFunction("size_t", self.meshQ, 1, 0)
+            for i in range(self.meshQ.num_cells()):
+                cell_marker[i] = i + 1
+
+            dx_sub = Measure("dx", domain=self.meshQ, subdomain_data=cell_marker)
+
+            for i in range(self.meshQ.num_cells()):
+                v0, v1 = self.meshQ.cells()[i]
+                Ri     = max(0.5 * (self.Q_radii[int(v0)] + self.Q_radii[int(v1)]), 0.005)
+
+                gamma_i    = self.kappa * 2 * np.pi * Ri
+                k1_i       = self.sigma1d_ref * np.pi * Ri**2
+                cylinder_i = Circle(radius=Ri, degree=10)
+
+                # same subdomain_data object, different tag ✓
+                dx_i = dx_sub(i + 1)
+
+                # C_mat: only rows for DOFs of edge i
+                C_i_petsc             = average_3d1d_matrix(V, Q, cylinder_i)
+                indptr, indices, data = C_i_petsc.getValuesCSR()
+                C_i_full              = csr_matrix((data, indices, indptr),
+                                                shape=(n_Q, n_V))
+                for dof in Q.dofmap().cell_dofs(i):
+                    C_mat[dof, :] = C_i_full[dof, :]
+
+                Ru_i = Average(u, self.meshQ, cylinder_i)
+                Rv_i = Average(v, self.meshQ, cylinder_i)
+
+                forms_00.append( gamma_i * inner(Ru_i, Rv_i) * dx_i)
+                forms_01.append(-gamma_i * inner(p,    Rv_i) * dx_i)
+                forms_10.append(-gamma_i * inner(q,    Ru_i) * dx_i)
+                forms_11.append( gamma_i * inner(p,    q)    * dx_i)
+                forms_a11.append(k1_i   * inner(grad(p), grad(q)) * dx_i)
+
+            self.C  = C_mat.tocsr()
+
+            m[0][0] = sum(forms_00)
+            m[0][1] = sum(forms_01)
+            m[1][0] = sum(forms_10)
+            m[1][1] = sum(forms_11)
+            a[1][1] = sum(forms_a11) + nitsche
+
+            self.AD, self.M, self.b = map(ii_assemble, (a, m, L))
+            self.A = self.AD + self.M          # gamma baked into forms ✓
+
+        # ══════════════════════════════════════════════════════════════════
+        # BRANCH 2 — uniform cylinder average
+        # ══════════════════════════════════════════════════════════════════
+        elif self.coupling_radius > 0:
+            cylinder = Circle(radius=self.coupling_radius, degree=10)
+            Ru       = Average(u, self.meshQ, cylinder)
+            Rv       = Average(v, self.meshQ, cylinder)
+            C_petsc  = average_3d1d_matrix(V, Q, cylinder)
+
+            m[0][0] =  inner(Ru, Rv) * dx_
+            m[0][1] = -inner(p,  Rv) * dx_
+            m[1][0] = -inner(q,  Ru) * dx_
+            m[1][1] =  inner(p,  q)  * dx_
+            a[1][1] = Constant(self.sigma1d) * inner(grad(p), grad(q)) * dx_ + nitsche
+            self.C  = csr_matrix(C_petsc.getValuesCSR()[::-1], shape=C_petsc.size)
+
+            self.AD, self.M, self.b = map(ii_assemble, (a, m, L))
+            self.A = self.AD + self.gamma * self.M
+
+        # ══════════════════════════════════════════════════════════════════
+        # BRANCH 3 — pointwise trace (zero radius)
+        # ══════════════════════════════════════════════════════════════════
+        else:
+            Ru      = Average(u, self.meshQ, None)
+            Rv      = Average(v, self.meshQ, None)
+            C_petsc = trace_3d1d_matrix(V, Q, self.meshQ)
+
+            m[0][0] =  inner(Ru, Rv) * dx_
+            m[0][1] = -inner(p,  Rv) * dx_
+            m[1][0] = -inner(q,  Ru) * dx_
+            m[1][1] =  inner(p,  q)  * dx_
+            a[1][1] = Constant(self.sigma1d) * inner(grad(p), grad(q)) * dx_ + nitsche
+            self.C  = csr_matrix(C_petsc.getValuesCSR()[::-1], shape=C_petsc.size)
+
+            self.AD, self.M, self.b = map(ii_assemble, (a, m, L))
+            self.A = self.AD + self.gamma * self.M
 
         print("System assembled.")
-
     def _split_solution(self):
         """Split the flat numpy solution into 3D and 1D dolfin Functions."""
         dimV        = self.W[0].dim()

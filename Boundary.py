@@ -85,13 +85,9 @@ boundary = Boundary(
     bbox   = None,
     inlet_points = [
         [-1.0,  0.0,  0.0],   # left pole
-        [-0.8,  0.6,  0.0],   # left-front
-        [-0.8, -0.6,  0.0],   # left-back
     ],
     outlet_points = [
         [ 1.0,  0.0,  0.0],   # right pole
-        [ 0.8,  0.6,  0.0],   # right-front
-        [ 0.8, -0.6,  0.0],   # right-back
     ],
     border_eps = 1e-2
 )

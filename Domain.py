@@ -114,8 +114,8 @@ class Domain:
         File(f"{self.name}_vaso.pvd") << self.vaso
 
     def export_xdmf(self):
-        """Write the marked vascular mesh and markers to .xdmf files."""
-        self._require("vaso", "vaso_markers")
+        """Write the marked vascular mesh, markers, and per-edge radii to .xdmf files."""
+        self._require("vaso", "vaso_markers", "vaso_radii")
 
         mesh_file = XDMFFile(MPI.comm_world, f"{self.name}_marked_mesh.xdmf")
         mesh_file.parameters["flush_output"] = True
@@ -127,7 +127,14 @@ class Domain:
         marker_file.write(self.vaso_markers)
         marker_file.close()
 
-        print(f"...xdmf files written → {self.name}_marked_mesh.xdmf / _markers.xdmf")
+        radius_file = XDMFFile(MPI.comm_world, f"{self.name}_radii.xdmf")
+        radius_file.parameters["flush_output"] = True
+        self.vaso_radii.rename("radius", "vessel radius")
+        radius_file.write(self.vaso_radii)
+        radius_file.close()
+
+        print(f"...xdmf files written → {self.name}_marked_mesh.xdmf / _markers.xdmf / _radii.xdmf")
+
 
    
     # =========================================================================
@@ -225,7 +232,7 @@ class Domain:
     def _build_network(self):
         """Extract the vascular network via shortest paths between inlet/outlet markers."""
         self._require("mesh1D", "markers")
-        self.vaso, self.vaso_markers = self._fun(
+        self.vaso, self.vaso_markers, self.vaso_radii = self._fun(
             self.mesh1D, self.n_vasi, self.n_ramifications, self.markers
         )
         print(f"N DOF vaso: {self.vaso.num_edges()}")
@@ -510,13 +517,15 @@ class Domain:
         return mesh1, markers
 
     def _fun(self, mesh, n_departures, n_arrivals, markers):
-        """Extract vascular network by finding shortest paths between inlet/outlet nodes."""
         import networkx as nx
-        from xii import EmbeddedMesh, transfer_markers  # noqa: local import
+        from xii import EmbeddedMesh, transfer_markers
 
         facet_f = MeshFunction("size_t", mesh, 1, 0)
         mesh.init(1, 0)
 
+        # per-vertex radius on the parent mesh (dim=0)
+        vertex_radii = MeshFunction("double", mesh, 0, 1.0)
+        
         G             = nx.Graph()
         edge_indices  = {}
         vertex_markers = markers.array()
@@ -542,8 +551,23 @@ class Domain:
 
         vaso         = EmbeddedMesh(facet_f, 1)
         vaso_markers = transfer_markers(vaso, markers)
-        return vaso, vaso_markers
+        # transfer_markers doesn't work for double MeshFunction
+        # instead: vaso vertices are a subset of parent vertices, same coordinates
+        # build coordinate → radius lookup on parent mesh
+        coord_to_radius = {}
+        parent_coords = mesh.coordinates()
+        for i in range(mesh.num_vertices()):
+            key = tuple(np.round(parent_coords[i], 10))
+            coord_to_radius[key] = vertex_radii[i]
 
+        # assign to vaso vertices by coordinate match
+        vaso_radii = MeshFunction("double", vaso, 0, 0.0)
+        vaso_coords = vaso.coordinates()
+        for i in range(vaso.num_vertices()):
+            key = tuple(np.round(vaso_coords[i], 10))
+            vaso_radii[i] = coord_to_radius.get(key, 1.0)  # fallback to 1.0
+
+        return vaso, vaso_markers, vaso_radii
     # =========================================================================
     # Utilities
     # =========================================================================
