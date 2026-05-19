@@ -146,15 +146,15 @@ class Solver3D1D:
 
         # ── 3D solution ───────────────────────────────────────────────
         with XDMFFile(f"{output_folder}/u3d.xdmf") as f:
-            f.parameters["flush_output"]          = True
-            f.parameters["functions_share_mesh"]  = True
+            f.parameters["flush_output"]         = True
+            f.parameters["functions_share_mesh"] = True
             self.u3d.rename("u3d", "3D pressure")
             f.write(self.u3d)
 
         # ── 1D solution ───────────────────────────────────────────────
         with XDMFFile(f"{output_folder}/u1d.xdmf") as f:
-            f.parameters["flush_output"]          = True
-            f.parameters["functions_share_mesh"]  = True
+            f.parameters["flush_output"]         = True
+            f.parameters["functions_share_mesh"] = True
             self.u1d.rename("u1d", "1D vessel pressure")
             f.write(self.u1d)
 
@@ -168,11 +168,41 @@ class Solver3D1D:
             f.parameters["flush_output"] = True
             f.write(self.Q_markers)
 
+        # ── per-edge radius (dim=1 cell function on 1D mesh) ──────────
+        if self.Q_radii is not None:
+            # Q_radii is dim=0 (vertex). Build a dim=1 edge version
+            # by averaging the two endpoint values — natural for ParaView
+            Q          = self.W[1]
+            edge_radii = MeshFunction("double", self.meshQ, 1, 0.0)
+            for cell in cells(self.meshQ):
+                v0, v1 = cell.entities(0)
+                edge_radii[cell.index()] = 0.5 * (
+                    self.Q_radii[int(v0)] + self.Q_radii[int(v1)]
+                )
+            with XDMFFile(f"{output_folder}/vessel_radii.xdmf") as f:
+                f.parameters["flush_output"] = True
+                edge_radii.rename("radius", "vessel radius")
+                f.write(edge_radii)
+
+            # also write as a 1D CG1 Function so ParaView can interpolate
+            # smoothly along each vessel segment
+            radius_fn = Function(Q)
+            for v_idx in range(self.meshQ.num_vertices()):
+                radius_fn.vector()[v_idx] = self.Q_radii[v_idx]
+            with XDMFFile(f"{output_folder}/vessel_radii_smooth.xdmf") as f:
+                f.parameters["flush_output"]         = True
+                f.parameters["functions_share_mesh"] = True
+                radius_fn.rename("radius_smooth", "vessel radius (smooth)")
+                f.write(radius_fn)
+
         print(f"ParaView files saved → {output_folder}/")
-        print(f"  u3d.xdmf          — 3D pressure field")
-        print(f"  u1d.xdmf          — 1D vessel pressure")
-        print(f"  cell_markers.xdmf — inside/outside regions")
-        print(f"  vessel_markers.xdmf — inlet/bulk/outlet tags")
+        print(f"  u3d.xdmf                — 3D pressure field")
+        print(f"  u1d.xdmf                — 1D vessel pressure")
+        print(f"  cell_markers.xdmf       — inside/outside regions")
+        print(f"  vessel_markers.xdmf     — inlet/bulk/outlet tags")
+        if self.Q_radii is not None:
+            print(f"  vessel_radii.xdmf       — per-edge radius (cell function)")
+            print(f"  vessel_radii_smooth.xdmf — per-vertex radius (CG1 function)")
     # =========================================================================
     # Private build steps
     # =========================================================================
