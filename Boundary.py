@@ -80,14 +80,24 @@ class Boundary:
         return f"Boundary(mode={self._mode!r})"
 
 
+
+np.random.seed(42)
+
+def random_sphere_points(n, x_sign, min_x=0.2):
+    pts = []
+    while len(pts) < n:
+        v = np.random.randn(3)
+        v = v / np.linalg.norm(v) * 0.9999   # ← just inside, not on boundary
+        if x_sign * v[0] > min_x:
+            pts.append(v.tolist())
+    return pts
+
+
+
 boundary = Boundary(
     source = lambda x, y, z: (x**2 + y**2 + z**2 <= 1.0),
     bbox   = None,
-    inlet_points = [
-        [-1.0,  0.0,  0.0],   # left pole
-    ],
-    outlet_points = [
-        [ 1.0,  0.0,  0.0],   # right pole
-    ],
-    border_eps = 1e-2
+    inlet_points  = random_sphere_points(40, x_sign=-1),
+    outlet_points = random_sphere_points(40, x_sign=+1),
+    border_eps = 10e-1
 )

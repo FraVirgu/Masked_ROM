@@ -523,8 +523,15 @@ class Domain:
         facet_f = MeshFunction("size_t", mesh, 1, 0)
         mesh.init(1, 0)
 
-        # per-vertex radius on the parent mesh (dim=0)
-        vertex_radii = MeshFunction("double", mesh, 0, 1.0)
+        R_MEAN = 0.01    # 10 µm — reference capillary radius
+        R_STD  = 0.003   # physiological spread
+        R_MIN  = 0.003   # smallest capillary
+        R_MAX  = 0.05    # largest arteriole
+
+        vertex_radii = MeshFunction("double", mesh, 0, R_MEAN)
+        for i in range(mesh.num_vertices()):
+            r = np.random.normal(R_MEAN, R_STD)
+            vertex_radii[i] = float(np.clip(r, R_MIN, R_MAX))
         
         G             = nx.Graph()
         edge_indices  = {}
