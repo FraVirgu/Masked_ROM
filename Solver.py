@@ -5,12 +5,111 @@ import numpy as np
 from scipy.sparse import csr_matrix, save_npz, lil_matrix
 from dolfin import *
 from xii import *
-from xii.assembler.average_matrix import average_matrix as average_3d1d_matrix, trace_3d1d_matrix
+from xii.assembler.average_matrix import average_matrix as average_3d1d_matrix, scalar_average_matrix, trace_3d1d_matrix
 from block.algebraic.hazmath import block_mat_to_block_dCSRmat
 from petsc4py import PETSc
 import haznics
 from Boundary import Boundary,boundary
 from dolfin import SubDomain
+from xii.linalg.matrix_utils import petsc_serial_matrix, is_number
+import tqdm
+
+def average_matrix_diff_radii(V, TV, TV_radii):
+    '''
+    Averaging matrix for reduction of g in V to TV by integration over shape.
+    '''
+    # We build a matrix representation of u in V -> Pi(u) in TV where
+    #
+    # Pi(u)(s) = |L(s)|^-1*\int_{L(s)}u(t) dx(s)
+    #
+    # Here L is the shape over which u is integrated for reduction.
+    # Its measure is |L(s)|.
+    mesh_x = TV.mesh().coordinates()
+    # The idea for point evaluation/computing dofs of TV is to minimize
+    # the number of evaluation. I mean a vector dof if done naively would
+    # have to evaluate at same x number of component times.
+    value_size = TV.ufl_element().value_size()
+    
+    mesh = V.mesh()
+    # Eval at points will require serch
+    tree = mesh.bounding_box_tree()
+    limit = mesh.num_cells()
+
+    TV_coordinates = TV.tabulate_dof_coordinates().reshape((TV.dim(), -1))
+    line_mesh = TV.mesh()
+    
+    TV_dm = TV.dofmap()
+    V_dm = V.dofmap()
+    # For non scalar we plan to make compoenents by shift
+    if value_size > 1:
+        TV_dm = TV.sub(0).dofmap()
+
+    Vel = V.element()               
+    basis_values = np.zeros(V.element().space_dimension()*value_size)
+    with petsc_serial_matrix(TV, V) as mat:
+
+        for line_cell in tqdm.tqdm(cells(line_mesh), desc=f'Averaging over {line_mesh.num_cells()} cells',
+                                   total=line_mesh.num_cells()):
+            # Get the tangent (normal of the plane which cuts the virtual
+            # surface to yield the bdry curve
+            v0, v1 = mesh_x[line_cell.entities(0)]
+            n = v0 - v1
+            index_cell = line_cell.index()
+            v0, v1 = TV.mesh().cells()[index_cell]
+            Ri     = max(0.5 * (TV_radii[int(v0)] + TV_radii[int(v1)]), 0.005)
+            shape = Circle(radius=Ri, degree=10)
+            # The idea is now to minimize the point evaluation
+            scalar_dofs = TV_dm.cell_dofs(line_cell.index())
+            scalar_dofs_x = TV_coordinates[scalar_dofs]
+            for scalar_row, avg_point in zip(scalar_dofs, scalar_dofs_x):
+                # Avg point here has the role of 'height' coordinate
+                quadrature = shape.quadrature(avg_point, n)
+                integration_points = quadrature.points
+                wq = quadrature.weights
+
+                curve_measure = sum(wq)
+
+                data = {}
+                for index, ip in enumerate(integration_points):
+                    c = tree.compute_first_entity_collision(Point(*ip))
+                    if c >= limit:
+                        c = None
+                        continue
+
+                    if c is None:
+                        cs = tree.compute_entity_collisions(Point(*ip))[:1]
+                    else:
+                        cs = (c, )
+                    # assert False
+                    for c in cs:
+                        Vcell = Cell(mesh, c)
+                        vertex_coordinates = Vcell.get_vertex_coordinates()
+                        cell_orientation = Vcell.orientation()
+                        basis_values[:] = Vel.evaluate_basis_all(ip, vertex_coordinates, cell_orientation)
+
+                        cols_ip = V_dm.cell_dofs(c)
+                        values_ip = basis_values*wq[index]
+                        # Add
+                        for col, value in zip(cols_ip, values_ip.reshape((-1, value_size))):
+                            if col in data:
+                                data[col] += value/curve_measure
+                            else:
+                                data[col] = value/curve_measure
+                            
+                # The thing now that with data we can assign to several
+                # rows of the matrix
+                column_indices = np.array(list(data.keys()), dtype='int32')
+                for shift in range(value_size):
+                    row = scalar_row + shift
+                    column_values = np.array([data[col][shift] for col in column_indices])
+                    mat.setValues([row], column_indices, column_values, PETSc.InsertMode.INSERT_VALUES)
+            # On to next avg point
+        # On to next cell
+    return mat
+
+
+
+
 
 class FEniCSBoundaryWrapper(SubDomain):
     def __init__(self, boundary_obj):
@@ -278,7 +377,6 @@ class Solver3D1D:
         u, v = TrialFunction(V), TestFunction(V)
         p, q = TrialFunction(Q), TestFunction(Q)
 
-        dx_     = Measure("dx", domain=self.meshQ)
         ds      = self.ds
         tag     = self.inlet_tag
         k3      = Constant(self.sigma3d)
@@ -288,19 +386,76 @@ class Solver3D1D:
         p_in    = Constant(1)
         u_out   = Constant(0.0)
         PENALTY = Constant(1e10)
+        dx_     = Measure("dx", domain=self.meshQ)
 
+        if self.Q_radii is None:
+            if self.coupling_radius <= 0:
+                raise ValueError("Either Q_radii or coupling_radius > 0 must be provided.")
+            self.Q_radii = MeshFunction("double", self.meshQ, 0, self.coupling_radius)
+            print(f"Q_radii not found — using uniform radius {self.coupling_radius}")
+
+        n_V = V.dofmap().global_dimension()
+        n_Q = Q.dofmap().global_dimension()
+
+        # ── C: single pass, variable radius ───────────────────────────────────
+        C_petsc            = average_matrix_diff_radii(V, Q, self.Q_radii)
+        indptr, idx, data_ = C_petsc.getValuesCSR()
+        C                  = csr_matrix((data_, idx, indptr), shape=(n_Q, n_V))
+        self.C             = C
+
+        # ── DG0 coefficients: one value per edge, no assembler ────────────────
+        DG0     = FunctionSpace(self.meshQ, "DG", 0)
+        gamma_f = Function(DG0)
+        k1_f    = Function(DG0)
+        for i in range(self.meshQ.num_cells()):
+            cv0, cv1            = self.meshQ.cells()[i]
+            Ri                  = max(0.5*(self.Q_radii[int(cv0)] + self.Q_radii[int(cv1)]), 0.005)
+            gamma_f.vector()[i] = self.kappa * 2 * np.pi * Ri
+            k1_f.vector()[i]    = self.sigma1d_ref * np.pi * Ri**2
+
+        # ── G: weighted 1D mass matrix — ONE assemble call ────────────────────
+        G_dolfin      = assemble(gamma_f * inner(p, q) * dx_)
+        gi, gj, gv    = as_backend_type(G_dolfin).mat().getValuesCSR()
+        G             = csr_matrix((gv, gj, gi), shape=(n_Q, n_Q))
+
+        # ── m blocks: pure scipy, zero FFC/averaging calls ────────────────────
+        M_00 =  C.T @ G @ C    # (n_V × n_V)
+        M_01 = -C.T @ G        # (n_V × n_Q)
+        M_10 = -G @ C          # (n_Q × n_V)
+        M_11 =  G              # (n_Q × n_Q)
+
+        def to_dolfin(A_sp):
+            """scipy CSR → dolfin PETSc matrix"""
+            A_sp = csr_matrix(A_sp)
+            pet  = PETSc.Mat().createAIJ(
+                size = A_sp.shape,
+                csr  = (A_sp.indptr.astype('int32'),
+                        A_sp.indices.astype('int32'),
+                        A_sp.data.copy())
+            )
+            pet.assemble()
+            return PETScMatrix(pet)
+
+        from block import block_mat as bmat
+        self.M = bmat([[to_dolfin(M_00), to_dolfin(M_01)],
+                    [to_dolfin(M_10), to_dolfin(M_11)]])
+
+        # ── block forms: a and L only, no m ───────────────────────────────────
         a = block_form(self.W, 2)
-        m = block_form(self.W, 2)
         L = block_form(self.W, 1)
 
-        # ── a[0][0]: 3D diffusion — identical in all branches ─────────────
         a[0][0] = (
             k3 * inner(grad(u), grad(v)) * self.d_omega(222)
             + k3 * inner(u, v)             * self.d_omega(222)
             + PENALTY * inner(u, v)        * self.d_omega(111)
         )
+        # k1_f is DG0 — single FFC call, no per-edge loop ✓
+        a[1][1] = k1_f * inner(grad(p), grad(q)) * dx_ + (
+            - inner(dot(grad(p), n_fct), q) * ds(tag, domain=self.meshQ)
+            - inner(p, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
+            + beta * (h_E**-1) * inner(p, q) * ds(tag, domain=self.meshQ)
+        )
 
-        # ── rhs — identical in all branches ───────────────────────────────
         L[0] = (
             inner(Constant(0), v) * self.d_omega(222)
             + PENALTY * inner(u_out, v) * self.d_omega(111)
@@ -310,106 +465,9 @@ class Solver3D1D:
             + beta * (h_E**-1) * inner(p_in, q) * ds(tag, domain=self.meshQ)
         )
 
-        # ── Nitsche boundary terms — identical in all branches ────────────
-        nitsche = (
-            - inner(dot(grad(p), n_fct), q) * ds(tag, domain=self.meshQ)
-            - inner(p, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
-            + beta * (h_E**-1) * inner(p, q) * ds(tag, domain=self.meshQ)
-        )
-
-        # ══════════════════════════════════════════════════════════════════
-        # BRANCH 1 — per-edge radii
-        # ══════════════════════════════════════════════════════════════════
-        if self.Q_radii is not None:
-            n_V   = V.dofmap().global_dimension()
-            n_Q   = Q.dofmap().global_dimension()
-            C_mat = lil_matrix((n_Q, n_V))
-
-            forms_00, forms_01, forms_10, forms_11, forms_a11 = [], [], [], [], []
-
-            # one MeshFunction, unique tag per edge — same subdomain_data
-            # object across all dx_i so UFL accepts sum(forms) ✓
-            cell_marker = MeshFunction("size_t", self.meshQ, 1, 0)
-            for i in range(self.meshQ.num_cells()):
-                cell_marker[i] = i + 1
-
-            dx_sub = Measure("dx", domain=self.meshQ, subdomain_data=cell_marker)
-
-            for i in range(self.meshQ.num_cells()):
-                v0, v1 = self.meshQ.cells()[i]
-                Ri     = max(0.5 * (self.Q_radii[int(v0)] + self.Q_radii[int(v1)]), 0.005)
-
-                gamma_i    = self.kappa * 2 * np.pi * Ri
-                k1_i       = self.sigma1d_ref * np.pi * Ri**2
-                cylinder_i = Circle(radius=Ri, degree=10)
-
-                # same subdomain_data object, different tag ✓
-                dx_i = dx_sub(i + 1)
-
-                # C_mat: only rows for DOFs of edge i
-                C_i_petsc             = average_3d1d_matrix(V, Q, cylinder_i)
-                indptr, indices, data = C_i_petsc.getValuesCSR()
-                C_i_full              = csr_matrix((data, indices, indptr),
-                                                shape=(n_Q, n_V))
-                for dof in Q.dofmap().cell_dofs(i):
-                    C_mat[dof, :] = C_i_full[dof, :]
-
-                Ru_i = Average(u, self.meshQ, cylinder_i)
-                Rv_i = Average(v, self.meshQ, cylinder_i)
-
-                forms_00.append( gamma_i * inner(Ru_i, Rv_i) * dx_i)
-                forms_01.append(-gamma_i * inner(p,    Rv_i) * dx_i)
-                forms_10.append(-gamma_i * inner(q,    Ru_i) * dx_i)
-                forms_11.append( gamma_i * inner(p,    q)    * dx_i)
-                forms_a11.append(k1_i   * inner(grad(p), grad(q)) * dx_i)
-
-            self.C  = C_mat.tocsr()
-
-            m[0][0] = sum(forms_00)
-            m[0][1] = sum(forms_01)
-            m[1][0] = sum(forms_10)
-            m[1][1] = sum(forms_11)
-            a[1][1] = sum(forms_a11) + nitsche
-
-            self.AD, self.M, self.b = map(ii_assemble, (a, m, L))
-            self.A = self.AD + self.M          # gamma baked into forms ✓
-
-        # ══════════════════════════════════════════════════════════════════
-        # BRANCH 2 — uniform cylinder average
-        # ══════════════════════════════════════════════════════════════════
-        elif self.coupling_radius > 0:
-            cylinder = Circle(radius=self.coupling_radius, degree=10)
-            Ru       = Average(u, self.meshQ, cylinder)
-            Rv       = Average(v, self.meshQ, cylinder)
-            C_petsc  = average_3d1d_matrix(V, Q, cylinder)
-
-            m[0][0] =  inner(Ru, Rv) * dx_
-            m[0][1] = -inner(p,  Rv) * dx_
-            m[1][0] = -inner(q,  Ru) * dx_
-            m[1][1] =  inner(p,  q)  * dx_
-            a[1][1] = Constant(self.sigma1d) * inner(grad(p), grad(q)) * dx_ + nitsche
-            self.C  = csr_matrix(C_petsc.getValuesCSR()[::-1], shape=C_petsc.size)
-
-            self.AD, self.M, self.b = map(ii_assemble, (a, m, L))
-            self.A = self.AD + self.gamma * self.M
-
-        # ══════════════════════════════════════════════════════════════════
-        # BRANCH 3 — pointwise trace (zero radius)
-        # ══════════════════════════════════════════════════════════════════
-        else:
-            Ru      = Average(u, self.meshQ, None)
-            Rv      = Average(v, self.meshQ, None)
-            C_petsc = trace_3d1d_matrix(V, Q, self.meshQ)
-
-            m[0][0] =  inner(Ru, Rv) * dx_
-            m[0][1] = -inner(p,  Rv) * dx_
-            m[1][0] = -inner(q,  Ru) * dx_
-            m[1][1] =  inner(p,  q)  * dx_
-            a[1][1] = Constant(self.sigma1d) * inner(grad(p), grad(q)) * dx_ + nitsche
-            self.C  = csr_matrix(C_petsc.getValuesCSR()[::-1], shape=C_petsc.size)
-
-            self.AD, self.M, self.b = map(ii_assemble, (a, m, L))
-            self.A = self.AD + self.gamma * self.M
+        self.AD = ii_assemble(a)
+        self.b  = ii_assemble(L)
+        self.A  = self.AD + self.M
 
         print("System assembled.")
     def _split_solution(self):
