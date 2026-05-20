@@ -371,13 +371,12 @@ if __name__ == "__main__":
     out_dir = f"./solution/{args.name}_rad{args.rad}_n{args.n}"
     solver  = Solver3D1D(
         path_to_1D_mesh = f"./nets/{args.name}/{args.name}_",
+        boundary        = boundary_cco,
         n               = args.n,
-        max_radius      = 0.1,
-        coupling_radius = args.rad,
         sigma3d         = 1e-3,
         sigma1d         = 1.0,
         kappa           = 1.0,
-        boundary        = boundary_cco,
+        
     ).build().solve()
 
     solver.save(out_dir)
