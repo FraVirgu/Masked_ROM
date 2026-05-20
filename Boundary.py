@@ -1,4 +1,8 @@
 import numpy as np
+
+
+
+
 class Boundary:
     def __init__(self, source, bbox=None, inlet_points=None, outlet_points=None, border_eps=1e-2):
         if callable(source):
@@ -91,6 +95,7 @@ def random_sphere_points(n, x_sign, min_x=0.2):
         if x_sign * v[0] > min_x:
             pts.append(v.tolist())
     return pts
+
 
 
 

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<Xdmf Version="3.0">
+  <Domain>
+    <Grid Name="mesh" GridType="Uniform">
+      <Topology NumberOfElements="67" TopologyType="PolyLine" NodesPerElement="2">
+        <DataItem Dimensions="67 2" NumberType="UInt" Format="HDF">vessel_radii_smooth.h5:/Mesh/mesh/topology</DataItem>
+      </Topology>
+      <Geometry GeometryType="XYZ">
+        <DataItem Dimensions="68 3" Format="HDF">vessel_radii_smooth.h5:/Mesh/mesh/geometry</DataItem>
+      </Geometry>
+      <Attribute Name="radius_smooth" AttributeType="Scalar" Center="Node">
+        <DataItem Dimensions="68 1" Format="HDF">vessel_radii_smooth.h5:/VisualisationVector/0</DataItem>
+      </Attribute>
+    </Grid>
+  </Domain>
+</Xdmf>

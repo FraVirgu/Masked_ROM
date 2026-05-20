@@ -176,6 +176,8 @@ class Solver3D1D:
         self.niters     = None   # solver iterations
         self.solve_time = None
 
+        self.boundary 
+
     # =========================================================================
     # Public API
     # =========================================================================
@@ -311,15 +313,30 @@ class Solver3D1D:
 
         # FIX 1: 3D box uses max_radius (= 0.1 in original), not coupling_radius
         r          = self.max_radius
-        inf_pt     = Point(-1 - 1.1*r, -1 - 1.1*r, -1 - 1.1*r)
-        max_pt     = Point( 1 + 1.1*r,  1 + 1.1*r,  1 + 1.1*r)
-        self.boundary = boundary
+        inf_pt     = Point(-1 , -1 , -1 )
+        max_pt     = Point( 1 ,  1 ,  1 )
         self.meshV = BoxMesh(inf_pt, max_pt, self.n, self.n, self.n)
         
         
 
         # MARKET dim=3 => cells (tetrahedra)       
         # Seperate the cell inside the subdomain (anatomical domain) from the cell outside the subdomain (outside anatomical domain)
+        # test a few known points against the boundary
+        test_points = [
+            [0.0,  0.0,  0.0],   # center → should be inside  (True)
+            [0.99, 0.99, 0.99],  # corner → should be outside (False)
+            [-0.99,-0.99,-0.99], # corner → should be outside (False)
+        ]
+        for p in test_points:
+            print(f"  boundary({p}) = {self.boundary(p)}")
+
+        # count inside/outside cells
+        inside  = sum(1 for c in cells(self.meshV)
+                    if self.boundary([c.midpoint().x(),
+                                        c.midpoint().y(),
+                                        c.midpoint().z()]))
+        total   = self.meshV.num_cells()
+        print(f"Cells inside domain: {inside}/{total} = {inside/total*100:.1f}%")
         
         self.V_cell_markers = MeshFunction("size_t", self.meshV, 3, 222)
         for cell in cells(self.meshV):
