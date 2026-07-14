@@ -1,0 +1,40 @@
+{
+  "generated": "2026-07-14T11:19:32",
+  "case": "Prova_14_07",
+  "exterior": "dirichlet",
+  "p_in": 1.0,
+  "single": {
+    "n": 40,
+    "beta": 500.0,
+    "h": 0.08660254037844395,
+    "h_over_R": 15.64590243410957,
+    "ndofs": 68921,
+    "n_int_dofs": 21546,
+    "u1d_min": 0.6715861989389715,
+    "u1d_max": 1.000155298759955,
+    "u3d_min": 0.5972274459534895,
+    "u3d_max": 1.007076516332011,
+    "over_1d": 0.00015529875995490272,
+    "over_3d": 0.006920142882447749,
+    "delivery": 0.001623337656332752,
+    "absorption": 0.0016233377658210102,
+    "imbal": 6.744638152866401e-08,
+    "pou": 4.440892098500626e-16,
+    "c_dropped": 0.0,
+    "worst_rise": 0.0,
+    "n_out": 67,
+    "niters": 40,
+    "solve_time": 0.9845385551452637,
+    "sigma3d": 0.001,
+    "sigma1d": 1.0,
+    "kappa": 1.0
+  },
+  "beta_sweep": [],
+  "mesh_sweep": [],
+  "verdict": [
+    "MONOTONICITY \u2014 OK. u1d decreases from the inlet to the outlets on every edge (worst rise +0.000e+00, within noise). Pressure falls along the tree, as it must with one source.",
+    "MASS CONSERVATION \u2014 OK. Delivery 1.623338e-03 vs absorption 1.623338e-03, relative imbalance 6.74e-08. These are computed by completely different routes (the discrete coupling operators C and G vs a volume integral), so agreement to this level is strong evidence the coupling is correct.",
+    "COUPLING OPERATOR \u2014 OK. max|C@1 - 1| = 4.44e-16. The circle-average reproduces constants exactly, so it is mass-preserving by construction.",
+    "RESOLUTION \u2014 the 3D cells are up to 16x larger than the thinnest vessel (h=0.0866). The line source is smeared over a cell, so the perivascular gradient is unresolved and u3d overshoots max(u1d) by +6.92e-03. This is a genuine modelling limitation, not a bug: resolving it needs local refinement around the centerlines."
+  ]
+}

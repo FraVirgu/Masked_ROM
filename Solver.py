@@ -18,8 +18,26 @@ import tqdm
 
 def average_matrix_diff_radii(V, TV, TV_radii):
     """
-    Averaging matrix for reduction of g in V to TV by integration over
-    a circle of radius R(s) at each point s of the 1D mesh.
+    Averaging matrix reducing g in V to TV by integration over the vessel
+    cross-section: a circle of radius R(s) centred at each point s of the 1D
+    mesh, lying in the plane normal to the centerline.
+
+    ONE CIRCLE PER VERTEX. An earlier version looped over EDGES and emitted a
+    row for both endpoints of each edge, so a vertex shared by k edges was
+    written k times — each time with the circle oriented along a DIFFERENT edge.
+    The writes used INSERT_VALUES, so the last one overwrote only the columns it
+    computed and left behind the columns written by the earlier, differently
+    oriented circles. Those rows became the union of several circles and summed
+    to more than 1 (up to 1.41), breaking mass conservation: the imbalance grew
+    with refinement instead of vanishing.
+
+    A point on the centerline has ONE cross-section, not one per incident
+    branch, so each vertex gets a single circle whose normal is the average of
+    its incident edge directions.
+
+    Invariant: C @ 1 == 1 exactly, on every row, for any mesh and any radius.
+    Enforced by normalising with the quadrature weight ACTUALLY used, so a row
+    stays a true average even if a quadrature point falls outside the mesh.
     """
     mesh_x         = TV.mesh().coordinates()
     value_size     = TV.ufl_element().value_size()
@@ -37,60 +55,97 @@ def average_matrix_diff_radii(V, TV, TV_radii):
     Vel          = V.element()
     basis_values = np.zeros(V.element().space_dimension() * value_size)
 
+    # --- per-vertex orientation and radius, from the incident edges ---
+    n_vtx    = line_mesh.num_vertices()
+    tangent  = np.zeros((n_vtx, 3))
+    r_sum    = np.zeros(n_vtx)
+    r_cnt    = np.zeros(n_vtx)
+
+    for idx_c, (a, b) in enumerate(line_mesh.cells()):
+        a, b = int(a), int(b)
+        e    = mesh_x[a] - mesh_x[b]
+        nrm  = np.linalg.norm(e)
+        if nrm > 0:
+            e = e / nrm
+        # Flip so incident edges agree in direction before averaging: at a
+        # bifurcation the branches point away from the parent, and summing them
+        # raw would cancel to ~0 instead of giving the local vessel axis.
+        for v in (a, b):
+            tangent[v] += e if np.dot(tangent[v], e) >= 0 else -e
+        R = max(0.5 * (TV_radii[a] + TV_radii[b]), 0.005)
+        for v in (a, b):
+            r_sum[v] += R
+            r_cnt[v] += 1
+
+    # vertex -> row of the matrix (CG1: one dof per vertex)
+    v2d = vertex_to_dof_map(TV)
+
     with petsc_serial_matrix(TV, V) as mat:
-        for line_cell in tqdm.tqdm(
-            cells(line_mesh),
-            desc=f"Averaging over {line_mesh.num_cells()} cells",
-            total=line_mesh.num_cells(),
+        for v in tqdm.tqdm(
+            range(n_vtx),
+            desc=f"Averaging over {n_vtx} vertices",
+            total=n_vtx,
         ):
-            v0, v1  = mesh_x[line_cell.entities(0)]
-            n       = v0 - v1
-            idx_c   = line_cell.index()
-            lv0, lv1 = TV.mesh().cells()[idx_c]
-            Ri      = max(0.5 * (TV_radii[int(lv0)] + TV_radii[int(lv1)]), 0.005)
-            shape   = Circle(radius=Ri, degree=10)
+            nrm = np.linalg.norm(tangent[v])
+            if nrm < 1e-14:
+                # degenerate (e.g. perfectly opposed branches) — fall back to
+                # any incident edge direction rather than a zero normal.
+                a, b   = line_mesh.cells()[0]
+                normal = mesh_x[int(a)] - mesh_x[int(b)]
+            else:
+                normal = tangent[v] / nrm
 
-            scalar_dofs   = TV_dm.cell_dofs(idx_c)
-            scalar_dofs_x = TV_coordinates[scalar_dofs]
+            Ri         = r_sum[v] / max(r_cnt[v], 1)
+            shape      = Circle(radius=Ri, degree=10)
+            scalar_row = int(v2d[v])
+            avg_point  = TV_coordinates[scalar_row]
 
-            for scalar_row, avg_point in zip(scalar_dofs, scalar_dofs_x):
-                quadrature         = shape.quadrature(avg_point, n)
-                integration_points = quadrature.points
-                wq                 = quadrature.weights
-                curve_measure      = sum(wq)
-                data               = {}
+            quadrature         = shape.quadrature(avg_point, normal)
+            integration_points = quadrature.points
+            wq                 = quadrature.weights
 
-                for index, ip in enumerate(integration_points):
-                    c = tree.compute_first_entity_collision(Point(*ip))
-                    if c >= limit:
-                        continue
-                    for c in (c,):
-                        Vcell              = Cell(mesh, c)
-                        vertex_coordinates = Vcell.get_vertex_coordinates()
-                        cell_orientation   = Vcell.orientation()
-                        basis_values[:]    = Vel.evaluate_basis_all(
-                            ip, vertex_coordinates, cell_orientation
-                        )
-                        cols_ip   = V_dm.cell_dofs(c)
-                        values_ip = basis_values * wq[index]
-                        for col, value in zip(
-                            cols_ip, values_ip.reshape((-1, value_size))
-                        ):
-                            if col in data:
-                                data[col] += value / curve_measure
-                            else:
-                                data[col]  = value / curve_measure
+            data          = {}
+            used_measure  = 0.0
+            for index, ip in enumerate(integration_points):
+                c = tree.compute_first_entity_collision(Point(*ip))
+                if c >= limit:
+                    continue
+                used_measure      += wq[index]
+                Vcell              = Cell(mesh, c)
+                vertex_coordinates = Vcell.get_vertex_coordinates()
+                cell_orientation   = Vcell.orientation()
+                basis_values[:]    = Vel.evaluate_basis_all(
+                    ip, vertex_coordinates, cell_orientation
+                )
+                cols_ip   = V_dm.cell_dofs(c)
+                values_ip = basis_values * wq[index]
+                for col, value in zip(
+                    cols_ip, values_ip.reshape((-1, value_size))
+                ):
+                    if col in data:
+                        data[col] += value
+                    else:
+                        data[col]  = value.copy()
 
-                column_indices = np.array(list(data.keys()), dtype="int32")
-                for shift in range(value_size):
-                    row           = scalar_row + shift
-                    column_values = np.array(
-                        [data[col][shift] for col in column_indices]
-                    )
-                    mat.setValues(
-                        [row], column_indices, column_values,
-                        PETSc.InsertMode.INSERT_VALUES,
-                    )
+            if used_measure <= 0.0:
+                raise RuntimeError(
+                    f"1D vertex {v} at {avg_point}: every quadrature point of "
+                    f"its averaging circle (R={Ri:.5f}) fell outside the 3D "
+                    f"mesh. The centerline must lie inside the domain."
+                )
+
+            # Normalise by the weight ACTUALLY used => the row is a true average
+            # and sums to exactly 1.
+            column_indices = np.array(list(data.keys()), dtype="int32")
+            for shift in range(value_size):
+                row           = scalar_row + shift
+                column_values = np.array(
+                    [data[col][shift] / used_measure for col in column_indices]
+                )
+                mat.setValues(
+                    [row], column_indices, column_values,
+                    PETSc.InsertMode.INSERT_VALUES,
+                )
     return mat
 
 
@@ -191,6 +246,8 @@ class Solver3D1D:
         self.A              = None
         self.b              = None
         self.C              = None
+        self.G              = None
+        self.C_dropped      = 0.0    # coupling weight zeroed by the elimination
         self.V_DOF          = None
 
         # --- populated by solve() ---
@@ -433,6 +490,7 @@ class Solver3D1D:
                 shape=C.shape,
             )
             C.eliminate_zeros()
+            self.C_dropped = float(lost)   # recorded for the physics diagnostic
             print(f"C: zeroed {len(self.ext_dofs)} exterior columns "
                   f"(dropped weight {lost:.3e})")
 
@@ -454,6 +512,7 @@ class Solver3D1D:
         G_dolfin   = assemble(gamma_f * inner(p, q) * dx_)
         gi, gj, gv = as_backend_type(G_dolfin).mat().getValuesCSR()
         G          = csr_matrix((gv, gj, gi), shape=(n_Q, n_Q))
+        self.G     = G   # kept for the mass-balance diagnostic
 
         # --- coupling blocks ---
         M_00 =  C.T @ G @ C

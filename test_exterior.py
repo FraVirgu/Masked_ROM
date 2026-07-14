@@ -78,7 +78,7 @@ def main():
     ap.add_argument("-graph",   type=str,   default="graphExport")
     ap.add_argument("-obj",     type=str,   default="graphExport/domain.obj")
     ap.add_argument("-n",       type=int,   default=40)
-    ap.add_argument("-penalty", type=float, default=1.0)
+    ap.add_argument("-penalty", type=float, default=1e-4)
     ap.add_argument("-tol",     type=float, default=1e-9,
                     help="tolerance for dirichlet vs restrict (should be exact)")
     args = ap.parse_args()

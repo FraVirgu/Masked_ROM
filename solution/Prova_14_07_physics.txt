@@ -1,0 +1,56 @@
+==============================================================================
+PHYSICS DIAGNOSTIC — Prova_14_07
+generated 2026-07-14T11:19:32
+==============================================================================
+
+Verification (are the equations solved correctly?) is covered by
+test_exterior.py: dirichlet == restrict to ~1e-11. This file asks the
+different question — does the solution obey the physics?
+
+------------------------------------------------------------------------------
+SINGLE CONFIGURATION
+------------------------------------------------------------------------------
+  n = 40   beta = 500.0   sigma3d = 0.001   kappa = 1.0
+  3D dofs 68921 (21546 interior)  h = 0.08660   h/Rmin = 15.6
+
+  u1d range            : [0.671586, 1.000155]
+  u3d range (interior) : [0.597227, 1.007077]
+  u1d over p_in        : +1.553e-04
+  u3d over max(u1d)    : +6.920e-03
+
+  MONOTONICITY (does u1d fall from the inlet to the outlets?)
+    outward edges      : 67
+    worst rise         : +0.000e+00  (relative to the u1d span; >0 means u1d went UP)
+
+  MASS BALANCE (delivery == absorption)
+    vessel delivery    : 1.62333766e-03
+    tissue absorption  : 1.62333777e-03
+    mass imbalance     : 6.745e-08
+
+  COUPLING OPERATOR
+    max|C@1 - 1|       : 4.441e-16  (must be ~0: averaging 1 over the circle must give 1)
+    coupling wt dropped: 0.000e+00
+
+==============================================================================
+VERDICT
+==============================================================================
+
+1. MONOTONICITY — OK. u1d decreases from the inlet to the outlets on every
+   edge (worst rise +0.000e+00, within noise). Pressure falls along the tree,
+   as it must with one source.
+
+2. MASS CONSERVATION — OK. Delivery 1.623338e-03 vs absorption 1.623338e-03,
+   relative imbalance 6.74e-08. These are computed by completely different
+   routes (the discrete coupling operators C and G vs a volume integral), so
+   agreement to this level is strong evidence the coupling is correct.
+
+3. COUPLING OPERATOR — OK. max|C@1 - 1| = 4.44e-16. The circle-average
+   reproduces constants exactly, so it is mass-preserving by construction.
+
+4. RESOLUTION — the 3D cells are up to 16x larger than the thinnest vessel
+   (h=0.0866). The line source is smeared over a cell, so the perivascular
+   gradient is unresolved and u3d overshoots max(u1d) by +6.92e-03. This is a
+   genuine modelling limitation, not a bug: resolving it needs local
+   refinement around the centerlines.
+
+==============================================================================
