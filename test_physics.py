@@ -693,10 +693,10 @@ def main():
                          "test)? both: run each in turn.")
     ap.add_argument("-out",   type=str, default=None,
                     help="path prefix for the result files (.txt + .json). "
-                         "Default: ./solution/<name>_physics")
+                         "Default: ./test_solution/<name>_physics")
     args = ap.parse_args()
 
-    out = args.out or f"./solution/{args.name}_physics"
+    out = args.out or f"./test_solution/{args.name}_physics"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
     cco = CCOVascularMesh(graph_folder=args.graph, obj_path=args.obj,
