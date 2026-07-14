@@ -123,11 +123,18 @@ class Solver3D1D:
         kappa           : float = 1.0,
         beta_nitsche    : float = 5.0,
         inlet_tag       : int   = 111,
+        exterior        : str   = "dirichlet",
+        penalty         : float = 1.0,
     ):
         if boundary is None:
             raise ValueError(
                 "boundary is required — pass a Boundary object built from "
                 "boundary_from_obj() or an analytic function."
+            )
+        if exterior not in ("penalty", "restrict", "dirichlet"):
+            raise ValueError(
+                f"exterior must be 'penalty', 'restrict' or 'dirichlet', "
+                f"got {exterior!r}."
             )
 
         # --- parameters ---
@@ -140,6 +147,32 @@ class Solver3D1D:
         self.beta_nitsche    = beta_nitsche
         self.inlet_tag       = inlet_tag
 
+        # How the exterior (111) region of the background box is handled:
+        #
+        # 'restrict'  : V lives on the SubMesh of the 222 cells. The exterior
+        #               DOFs do not exist. No parameter. This is the reference.
+        # 'dirichlet' : V lives on the full box, but the DOFs with no support in
+        #               any 222 cell are eliminated exactly (zero row/column, 1
+        #               on the diagonal, 0 on the rhs). A DOF pinned to zero
+        #               contributes nothing to any interior equation, so this
+        #               reproduces 'restrict' to solver tolerance — but keeps
+        #               u3d defined on the full box mesh.
+        # 'penalty'   : V on the full box, exterior pinned by
+        #               penalty*inner(u,v)*dx(111). Only an APPROXIMATION: the
+        #               integral also hits the interface vertices shared with
+        #               the 222 cells, so a penalty large enough to pin the
+        #               exterior also contaminates the interior. Kept for
+        #               comparison; prefer 'restrict' or 'dirichlet'.
+        self.exterior = exterior
+        self.penalty  = penalty
+        if exterior == "penalty" and penalty <= 0.0:
+            raise ValueError(
+                "penalty must be > 0 with exterior='penalty': the exterior DOFs "
+                "appear in no other term, so penalty=0 leaves them with an "
+                "all-zero row/column and the matrix is singular (UMFPACK -5). "
+                "Use exterior='restrict' to remove those DOFs instead."
+            )
+
         # --- populated by build() ---
         self.meshV          = None
         self.meshQ          = None
@@ -148,6 +181,10 @@ class Solver3D1D:
         self.V_cell_markers = None
         self.d_omega        = None
         self.ds             = None
+        self.meshV_full     = None   # background box (== meshV when exterior='penalty')
+        self.parent_vertex  = None   # submesh vertex -> box vertex (exterior='restrict')
+        self.ext_dofs       = None   # eliminated V dofs      (exterior='dirichlet')
+        self.int_dofs       = None   # kept V dofs            (exterior='dirichlet')
         self.W              = None
         self.AD             = None
         self.M              = None
@@ -284,6 +321,28 @@ class Solver3D1D:
         total = self.meshV.num_cells()
         print(f"3D mesh: {total} cells  |  "
               f"inside domain: {inside_count} ({inside_count/total*100:.1f}%)")
+        if inside_count == 0:
+            raise RuntimeError(
+                "No cell midpoint falls inside the boundary — the interior is "
+                "empty. Check the boundary scale/center."
+            )
+
+        self.meshV_full = self.meshV
+
+        if self.exterior == "restrict":
+            # Keep only the cells marked 222. The exterior DOFs then simply do
+            # not exist, so no penalty is needed to make a[0][0] nonsingular.
+            submesh            = SubMesh(self.meshV, self.V_cell_markers, 222)
+            self.parent_vertex = submesh.data().array(
+                "parent_vertex_indices", 0
+            ).copy()
+            self.meshV         = submesh
+
+            # Every cell of the submesh is interior: re-mark uniformly as 222 so
+            # the d_omega(222) forms below carry over unchanged.
+            self.V_cell_markers = MeshFunction("size_t", self.meshV, 3, 222)
+            print(f"3D mesh restricted to interior: {self.meshV.num_cells()} cells "
+                  f"| {self.meshV.num_vertices()} vertices")
 
         self.d_omega = Measure("dx", domain=self.meshV,
                                subdomain_data=self.V_cell_markers)
@@ -333,6 +392,9 @@ class Solver3D1D:
         self.V_DOF = V.dofmap().global_dimension()
         print(f"3D DOFs: {self.V_DOF}  |  1D DOFs: {Q.dofmap().global_dimension()}")
 
+        if self.exterior == "dirichlet":
+            self._find_exterior_dofs(V)
+
         u, v   = TrialFunction(V), TestFunction(V)
         p, q   = TrialFunction(Q), TestFunction(Q)
         ds     = self.ds
@@ -343,7 +405,6 @@ class Solver3D1D:
         n_fct  = FacetNormal(self.meshQ)
         p_in   = Constant(1.0)
         u_out  = Constant(0.0)
-        PENALTY = Constant(1e10)
         dx_    = Measure("dx", domain=self.meshQ)
 
         n_V = V.dofmap().global_dimension()
@@ -353,7 +414,29 @@ class Solver3D1D:
         C_petsc            = average_matrix_diff_radii(V, Q, self.Q_radii)
         indptr, idx, data_ = C_petsc.getValuesCSR()
         C                  = csr_matrix((data_, idx, indptr), shape=(n_Q, n_V))
-        self.C             = C
+
+        if self.exterior == "dirichlet":
+            # A coupling circle near the interface can sample an exterior cell,
+            # so C may have columns on eliminated DOFs. Those DOFs are 0, so
+            # their contribution to the coupling is 0 — drop the columns before
+            # M is formed, otherwise M would reintroduce entries on rows that
+            # the elimination below zeroes out.
+            is_ext = np.zeros(n_V, dtype=bool)
+            is_ext[self.ext_dofs] = True
+
+            Ccoo = C.tocoo()
+            drop = is_ext[Ccoo.col]
+            lost = np.abs(Ccoo.data[drop]).sum()
+
+            C = csr_matrix(
+                (Ccoo.data[~drop], (Ccoo.row[~drop], Ccoo.col[~drop])),
+                shape=C.shape,
+            )
+            C.eliminate_zeros()
+            print(f"C: zeroed {len(self.ext_dofs)} exterior columns "
+                  f"(dropped weight {lost:.3e})")
+
+        self.C = C
 
         # --- per-edge DG0 coefficients from per-vertex radii ---
         DG0     = FunctionSpace(self.meshQ, "DG", 0)
@@ -397,12 +480,15 @@ class Solver3D1D:
         a = block_form(self.W, 2)
         L = block_form(self.W, 1)
 
-        # 3D: diffusion inside domain + penalty outside
+        # 3D: diffusion inside the domain. With exterior='penalty' the DOFs in
+        # the 111 region appear in no other term, so they need the penalty to
+        # get a nonzero diagonal; with exterior='restrict' they do not exist.
         a[0][0] = (
             k3 * inner(grad(u), grad(v)) * self.d_omega(222)
             + k3 * inner(u, v)           * self.d_omega(222)
-            + PENALTY * inner(u, v)      * self.d_omega(111)
         )
+        if self.exterior == "penalty":
+            a[0][0] += Constant(self.penalty) * inner(u, v) * self.d_omega(111)
 
         # 1D: diffusion + Nitsche inlet BC
         a[1][1] = k1_f * inner(grad(p), grad(q)) * dx_ + (
@@ -410,11 +496,9 @@ class Solver3D1D:
             - inner(p, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
             + beta * (h_E ** -1) * inner(p, q) * ds(tag, domain=self.meshQ)
         )
-
-        L[0] = (
-            inner(Constant(0), v) * self.d_omega(222)
-            + PENALTY * inner(u_out, v) * self.d_omega(111)
-        )
+        L[0] = inner(Constant(0), v) * self.d_omega(222)
+        if self.exterior == "penalty":
+            L[0] += Constant(self.penalty) * inner(u_out, v) * self.d_omega(111)
         L[1] = (
             - inner(p_in, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
             + beta * (h_E ** -1) * inner(p_in, q) * ds(tag, domain=self.meshQ)
@@ -422,8 +506,96 @@ class Solver3D1D:
 
         self.AD = ii_assemble(a)
         self.b  = ii_assemble(L)
+
+        if self.exterior == "dirichlet":
+            # Exact elimination of the exterior DOFs: zero row + zero column, 1
+            # on the diagonal, 0 on the rhs. Unlike the penalty, this touches
+            # ONLY the DOFs with no support in a 222 cell, so it cannot
+            # contaminate the interface. u=0 there contributes nothing to any
+            # interior equation, so the interior solution is exactly the one
+            # exterior='restrict' computes.
+            #
+            # M already has zero exterior rows/cols (C's columns were zeroed
+            # above), so eliminating in AD is enough for A = AD + M.
+            self._eliminate_exterior(self.AD, self.b)
         self.A  = self.AD + self.M
         print("System assembled.")
+
+    def _find_exterior_dofs(self, V):
+        """
+        Split V's dofs into those with support in at least one 222 cell and
+        those with none. Only the latter are eliminated: a dof on the 111/222
+        interface DOES have interior support and must be left alone (this is
+        exactly what the penalty formulation gets wrong).
+        """
+        dm      = V.dofmap()
+        n       = V.dim()
+        has_int = np.zeros(n, dtype=bool)
+
+        for cell in cells(self.meshV):
+            if self.V_cell_markers[cell] == 222:
+                has_int[dm.cell_dofs(cell.index())] = True
+
+        self.int_dofs = np.flatnonzero(has_int)
+        self.ext_dofs = np.flatnonzero(~has_int)
+        print(f"Dirichlet elimination: {len(self.ext_dofs)} exterior dofs "
+              f"removed | {len(self.int_dofs)} kept "
+              f"({len(self.int_dofs)/n*100:.1f}%)")
+
+        if len(self.ext_dofs) == 0:
+            raise RuntimeError(
+                "exterior='dirichlet' found no exterior dofs — every dof has "
+                "interior support, so there is nothing to eliminate."
+            )
+
+    def _eliminate_exterior(self, AD, b):
+        """
+        Zero the rows and columns of AD[0][0] on self.ext_dofs, put 1 on the
+        diagonal, and zero b[0] there. Symmetric, so the block stays SPD.
+        """
+        A00 = as_backend_type(ii_convert(AD[0][0])).mat()
+        Asp = csr_matrix(A00.getValuesCSR()[::-1], shape=A00.getSize()).tocoo()
+
+        n       = Asp.shape[0]
+        is_ext  = np.zeros(n, dtype=bool)
+        is_ext[self.ext_dofs] = True
+
+        # Drop every nonzero whose row OR column is an eliminated dof, then add
+        # a unit diagonal there. Done on the COO triplets so we never densify:
+        # a fancy-indexed row/col assignment on LIL would materialise an
+        # (n_ext x n) dense block.
+        keep = ~(is_ext[Asp.row] | is_ext[Asp.col])
+        rows = np.concatenate([Asp.row[keep], self.ext_dofs])
+        cols = np.concatenate([Asp.col[keep], self.ext_dofs])
+        vals = np.concatenate([Asp.data[keep], np.ones(len(self.ext_dofs))])
+
+        Asp = csr_matrix((vals, (rows, cols)), shape=(n, n))
+        Asp.eliminate_zeros()
+
+        pet = PETSc.Mat().createAIJ(
+            size=Asp.shape,
+            csr=(Asp.indptr.astype("int32"),
+                 Asp.indices.astype("int32"),
+                 Asp.data.copy()),
+        )
+        pet.assemble()
+        AD[0][0] = PETScMatrix(pet)
+
+        # rhs: u = 0 on the eliminated dofs. L[0] only integrates over 222, so
+        # these entries should already be ~0 — assert rather than assume.
+        ext = self.ext_dofs
+        b0  = ii_convert(b[0])
+        arr = b0.get_local()
+        big = np.abs(arr[ext]).max() if len(ext) else 0.0
+        if big > 1e-12:
+            raise RuntimeError(
+                f"rhs is {big:.3e} on an eliminated exterior dof — expected 0. "
+                f"The 3D rhs should integrate over 222 only."
+            )
+        arr[ext] = 0.0
+        b0.set_local(arr)
+        b0.apply("insert")
+        b[0] = b0
 
     def _split_solution(self):
         dimV          = self.W[0].dim()
