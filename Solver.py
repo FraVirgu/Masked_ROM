@@ -173,9 +173,9 @@ class Solver3D1D:
         path_to_1D_mesh : str,
         boundary        : Boundary,      # REQUIRED — no default
         n               : int   = 10,
-        sigma3d         : float = 1e-3,
-        sigma1d         : float = 1.0,
-        kappa           : float = 1.0,
+        sigma3d         : float = 1e-6,
+        sigma1d         : float = 10,
+        kappa           : float = 5.0,
         beta_nitsche    : float = 5.0,
         inlet_tag       : int   = 111,
         exterior        : str   = "dirichlet",
@@ -460,7 +460,7 @@ class Solver3D1D:
         beta   = Constant(self.beta_nitsche)
         h_E    = MaxCellEdgeLength(self.meshQ)
         n_fct  = FacetNormal(self.meshQ)
-        p_in   = Constant(1.0)
+        p_in   = Constant(5.0)
         u_out  = Constant(0.0)
         dx_    = Measure("dx", domain=self.meshQ)
 

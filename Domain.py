@@ -6,7 +6,8 @@ from dolfin import (
     Mesh, MeshEditor, MeshFunction, File, Point, BoxMesh,
     XDMFFile, MPI, cells
 )
-from Boundary import Boundary, boundary  # noqa: local import
+from Boundary import Boundary, boundary
+from Solver import Solver3D1D  # noqa: local import
 
 class Domain:
     """
@@ -416,7 +417,6 @@ class Domain:
 
     def _plane_new_verts(self, mesh, planes_in, n_in, planes_out, n_out):
         """Project boundary vertices onto inlet/outlet planes and rebuild mesh with markers."""
-        from xii import EmbeddedMesh, transfer_markers  # noqa: local import
         
         vertices = mesh.coordinates()
         nv_old   = len(vertices)
@@ -599,25 +599,76 @@ class Domain:
 
 
 
-import argparse
+# =============================================================================
+# Entry point
+# =============================================================================
 
-parser = argparse.ArgumentParser()
-parser.add_argument("-name",   type=str)
-parser.add_argument("-test",   type=str)
-parser.add_argument("-inlet",  type=int)
-parser.add_argument("-outlet", type=int)
-args, _ = parser.parse_known_args()
+if __name__ == "__main__":
+    import os
+    import argparse
 
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Build a simple analytic (non-OpenCCO) vascular domain and "
+                    "solve the 3D-1D problem with the no-penalty solver.",
+    )
+    parser.add_argument("-name",   type=str, required=True,
+                        help="subfolder name inside nets/ (e.g. sphere01)")
+    parser.add_argument("-inlet",  type=int, default=4,
+                        help="number of inflow vessels (n_vasi)")
+    parser.add_argument("-outlet", type=int, default=4,
+                        help="ramifications per vessel (n_ramifications)")
+    parser.add_argument("-n",      type=int, default=20,
+                        help="3D background mesh resolution")
+    parser.add_argument("-sigma1d", type=float, default=1.0,
+                        help="1D conductivity (sigma1d)")
+    parser.add_argument("-sigma3d", type=float, default=1e-3,
+                        help="3D conductivity (sigma3d)")
+    parser.add_argument("-kappa", type=float, default=1.0,
+                        help="coupling coefficient (kappa)")
+    args = parser.parse_args()
 
+    # nets/{name}/ holds every mesh file this run writes and the solver reads.
+    #
+    # Domain's export_* methods build filenames as f"{self.name}_marked_mesh.xdmf"
+    # (i.e. they add the trailing '_'), while the solver reads them back as
+    # f"{path_to_1D_mesh}marked_mesh.xdmf" (no added '_'). So self.name must NOT
+    # end in '_', and path_to_1D_mesh MUST — otherwise the underscores don't line
+    # up and the solver looks for a file the domain never wrote.
+    net_dir = os.path.join("nets", args.name)
+    os.makedirs(net_dir, exist_ok=True)
+    name_stem = os.path.join(net_dir, args.name)   # nets/NAME/NAME      (no trailing _)
+    mesh_prefix = f"{name_stem}_"                   # nets/NAME/NAME_     (solver prefix)
 
-domain = Domain(
-    name            = f"./nets/{args.test}/{args.name}_",
-    n_vasi          = args.inlet,
-    n_ramifications = args.outlet,
-    boundary        = boundary
-).build()
+    # --- 1. build the analytic-boundary domain (unit sphere from Boundary.py) ---
+    domain = Domain(
+        name            = name_stem,
+        n_vasi          = args.inlet,
+        n_ramifications = args.outlet,
+        boundary        = boundary,
+    ).build()
 
-domain.export_box()
-domain.export_reticolo()
-domain.export_vaso()
-domain.export_xdmf()
+    domain.export_box()
+    domain.export_reticolo()
+    domain.export_vaso()
+    domain.export_xdmf()
+
+    # --- 2. run the solver WITHOUT the boundary penalty ---
+    # exterior='dirichlet' eliminates the exterior DOFs exactly instead of
+    # pinning them with a penalty term, so the interface is not contaminated.
+    out_dir = (
+        f"./solution/Simple{args.name}_n{args.n}"
+        f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}"
+    )
+    solver  = Solver3D1D(
+        path_to_1D_mesh = mesh_prefix,
+        boundary        = boundary,
+        n               = args.n,
+        sigma3d         = args.sigma3d,
+        sigma1d         = args.sigma1d,
+        kappa           = args.kappa,
+        exterior        = "dirichlet",
+    ).build().solve()
+
+    solver.save(out_dir)
+    solver.save_paraview(f"{out_dir}/paraview")

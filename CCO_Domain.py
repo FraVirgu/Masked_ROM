@@ -54,7 +54,7 @@ def boundary_from_obj(obj_path: str, scale: float, center: np.ndarray) -> Bounda
         (float(p_min[2]), float(p_max[2])),
     )
 
-    print(f"Boundary bbox (scaled):")
+    print("Boundary bbox (scaled):")
     print(f"  x: [{bbox[0][0]:.4f}, {bbox[0][1]:.4f}]  size={bbox[0][1]-bbox[0][0]:.4f}")
     print(f"  y: [{bbox[1][0]:.4f}, {bbox[1][1]:.4f}]  size={bbox[1][1]-bbox[1][0]:.4f}")
     print(f"  z: [{bbox[2][0]:.4f}, {bbox[2][1]:.4f}]  size={bbox[2][1]-bbox[2][0]:.4f}")
@@ -209,7 +209,7 @@ class CCOVascularMesh:
         g = np.array(list(self.vertices.values()))
         print(f"Loaded {len(vertices)} vertices, {len(edges)} edges")
         print(f"Domain scale={scale:.6f}, center={np.round(center, 3)}")
-        print(f"Graph range after scaling:")
+        print("Graph range after scaling:")
         print(f"  x=[{g[:,0].min():.4f}, {g[:,0].max():.4f}]  "
               f"y=[{g[:,1].min():.4f}, {g[:,1].max():.4f}]  "
               f"z=[{g[:,2].min():.4f}, {g[:,2].max():.4f}]")
@@ -342,14 +342,20 @@ if __name__ == "__main__":
     )
     parser.add_argument("-name",  type=str,   required=True,
                         help="subfolder name inside nets/ (e.g. liver05)")
-    parser.add_argument("-graph", type=str,   default="graphExport",
+    parser.add_argument("-graph", type=str,   default="graph/liver_toy",
                         help="folder with vertex.dat / edges.dat / radius.dat")
-    parser.add_argument("-obj",   type=str,   default="graphExport/domain.obj",
+    parser.add_argument("-obj",   type=str,   default="graph/liver_toy/domain.obj",
                         help="path to liver domain OBJ file")
     parser.add_argument("-n",     type=int,   default=40,
                         help="3D mesh resolution")
     parser.add_argument("-rad",   type=float, default=0.05,
                         help="coupling radius")
+    parser.add_argument("-sigma1d", type=float, default=1.0,
+                        help="1D conductivity (sigma1d)")
+    parser.add_argument("-sigma3d", type=float, default=1e-3,
+                        help="3D conductivity (sigma3d)")
+    parser.add_argument("-kappa", type=float, default=1.0,
+                        help="coupling coefficient (kappa)")
     args = parser.parse_args()
 
     # --- 1. build vascular mesh (domain OBJ drives scaling) ---
@@ -368,15 +374,17 @@ if __name__ == "__main__":
     )
 
     # --- 3. run solver ---
-    out_dir = f"./solution/{args.name}_rad{args.rad}_n{args.n}"
+    out_dir = (
+        f"./solution/CCO{args.name}_n{args.n}"
+        f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}"
+    )
     solver  = Solver3D1D(
         path_to_1D_mesh = f"./nets/{args.name}/{args.name}_",
         boundary        = boundary_cco,
         n               = args.n,
-        sigma3d         = 1e-3,
-        sigma1d         = 1.0,
-        kappa           = 1.0,
-        
+        sigma3d         = args.sigma3d,
+        sigma1d         = args.sigma1d,
+        kappa           = args.kappa,
     ).build().solve()
 
     solver.save(out_dir)
