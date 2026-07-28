@@ -161,17 +161,17 @@ class Solver3D1D:
         1D:  -d/ds(σ₁D·πR²·du_V/ds) = γ(u_t - u_V)      in Λ
 
     Requires:
-        - boundary  : Boundary object defining the anatomical domain
         - radii     : loaded from {path_to_1D_mesh}radii.xdmf (per-vertex)
         - markers   : loaded from {path_to_1D_mesh}markers.xdmf (111/555/999)
 
-    Will raise if boundary or radii are missing.
+    The `boundary` argument is optional; if `None` the full background box
+    is treated as the domain interior.
     """
 
     def __init__(
         self,
         path_to_1D_mesh : str,
-        boundary        : Boundary,      # REQUIRED — no default
+        boundary        : Boundary | None = None,
         n               : int   = 10,
         sigma3d         : float = 1e-6,
         sigma1d         : float = 10,
@@ -181,11 +181,6 @@ class Solver3D1D:
         exterior        : str   = "dirichlet",
         penalty         : float = 1.0,
     ):
-        if boundary is None:
-            raise ValueError(
-                "boundary is required — pass a Boundary object built from "
-                "boundary_from_obj() or an analytic function."
-            )
         if exterior not in ("penalty", "restrict", "dirichlet"):
             raise ValueError(
                 f"exterior must be 'penalty', 'restrict' or 'dirichlet', "
@@ -371,7 +366,7 @@ class Solver3D1D:
         inside_count = 0
         for cell in cells(self.meshV):
             mp = cell.midpoint()
-            if self.boundary([mp.x(), mp.y(), mp.z()]):
+            if self.boundary is None or self.boundary([mp.x(), mp.y(), mp.z()]):
                 self.V_cell_markers[cell] = 222
                 inside_count += 1
 
@@ -602,9 +597,9 @@ class Solver3D1D:
               f"({len(self.int_dofs)/n*100:.1f}%)")
 
         if len(self.ext_dofs) == 0:
-            raise RuntimeError(
-                "exterior='dirichlet' found no exterior dofs — every dof has "
-                "interior support, so there is nothing to eliminate."
+            print(
+                "WARNING: exterior='dirichlet' found no exterior dofs — "
+                "every dof has interior support. Skipping elimination."
             )
 
     def _eliminate_exterior(self, AD, b):

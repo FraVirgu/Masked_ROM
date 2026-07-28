@@ -1,0 +1,46 @@
+{
+  "generated": "2026-07-28T13:57:20",
+  "case": "Prova_14_07",
+  "n": 40,
+  "penalty": 0.0001,
+  "tol": 1e-09,
+  "dims": {
+    "restrict": 37255,
+    "dirichlet": 68921,
+    "penalty": 68921
+  },
+  "iters": {
+    "restrict": 38,
+    "dirichlet": 39,
+    "penalty": 39
+  },
+  "dirichlet": {
+    "label": "dirichlet",
+    "n_interior": 37255,
+    "n_exterior": 31666,
+    "ndofs": 68921,
+    "niters": 39,
+    "rel_l2_3d": 2.7286774402138267e-08,
+    "max_diff_3d": 1.322673250925277e-07,
+    "max_ext": 0.0,
+    "rel_l2_1d": 2.2811805122885558e-08,
+    "passed": false
+  },
+  "penalty_run": {
+    "label": "penalty",
+    "n_interior": 37255,
+    "n_exterior": 31666,
+    "ndofs": 68921,
+    "niters": 39,
+    "rel_l2_3d": 0.0028363188706685013,
+    "max_diff_3d": 0.012954859553512943,
+    "max_ext": 3.108306788215871,
+    "rel_l2_1d": 0.001793696571200293,
+    "passed": false
+  },
+  "verdict": [
+    "DIRICHLET != RESTRICT \u2014 FAIL (rel L2 2.73e-08). These MUST agree: a dof pinned to zero contributes nothing to any interior equation. The elimination or the dof/vertex mapping is wrong.",
+    "PENALTY \u2014 differs from the reference by 2.84e-03 on the interior at penalty=0.0001, and leaves the exterior at max|u| = 3.11e+00 (want ~0). This is EXPECTED and is why the penalty formulation was abandoned: the dx(111) integral also hits the interface vertices shared with the 222 cells, so a penalty strong enough to pin the exterior contaminates the interior, and one weak enough to spare the interior does not pin the exterior. There is no good value; below ~1e-6 the matrix becomes singular (UMFPACK -5).",
+    "USE 'restrict' (37255 dofs) unless u3d is needed on the full background box; then use 'dirichlet' (68921 dofs, same answer). Both are exact and parameter-free. Do not use 'penalty'."
+  ]
+}

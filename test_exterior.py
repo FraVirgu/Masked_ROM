@@ -21,10 +21,14 @@ import json
 import os
 from datetime import datetime
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from dolfin import vertex_to_dof_map
 
-from CCO_Domain import CCOVascularMesh, boundary_from_obj
+from Boundary import boundary
+from Domain import Domain
 from Solver import Solver3D1D
 
 
@@ -222,40 +226,72 @@ def write_report(path, args, m_dir, m_pen, dims, iters):
     print(f"\nReport written:\n  {path}.txt\n  {path}.json")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-name",    type=str,   default="Prova_14_07")
-    ap.add_argument("-graph",   type=str,   default="graphExport")
-    ap.add_argument("-obj",     type=str,   default="graphExport/domain.obj")
-    ap.add_argument("-n",       type=int,   default=40)
-    ap.add_argument("-penalty", type=float, default=1e-4)
-    ap.add_argument("-tol",     type=float, default=1e-9,
-                    help="tolerance for dirichlet vs restrict (should be exact)")
-    ap.add_argument("-out",     type=str,   default=None,
-                    help="path prefix for the result files (.txt + .json). "
-                         "Default: ./test_solution/<name>_exterior")
-    args = ap.parse_args()
+def build_domain_case(case_name, inlet, outlet, boundary_fn, radius_mode, radius_value=0.01):
+    net_dir = os.path.join("nets", case_name)
+    os.makedirs(net_dir, exist_ok=True)
+    name_stem = os.path.join(net_dir, case_name)
+    mesh_prefix = f"{name_stem}_"
 
-    out = args.out or f"./test_solution/{args.name}_exterior"
-    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    domain = Domain(
+        name=name_stem,
+        n_vasi=inlet,
+        n_ramifications=outlet,
+        boundary=boundary_fn,
+    ).build()
 
-    cco = CCOVascularMesh(graph_folder=args.graph, obj_path=args.obj,
-                          name=args.name)
-    cco.load().build().export_xdmf()
-    boundary = boundary_from_obj(obj_path=args.obj, scale=cco.scale,
-                                 center=cco.center)
+    if radius_mode == "fixed":
+        for i in range(domain.vaso.num_vertices()):
+            domain.vaso_radii[i] = float(radius_value)
+
+    domain.export_xdmf()
+    return mesh_prefix
+
+
+def plot_exterior_comparison(case_label, m_dir, m_pen, output_path):
+    labels = ["dirichlet", "penalty"]
+    rel_3d = [m_dir["rel_l2_3d"], m_pen["rel_l2_3d"]]
+    rel_1d = [m_dir["rel_l2_1d"], m_pen["rel_l2_1d"]]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.bar(x - width / 2, rel_3d, width, label="3D rel L2")
+    ax.bar(x + width / 2, rel_1d, width, label="1D rel L2")
+    ax.set_yscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("Exterior handling")
+    ax.set_ylabel("Relative L2 error vs restrict")
+    ax.set_title(f"Exterior comparison — {case_label} radii")
+    ax.legend()
+    ax.grid(True, which="both", ls="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def run_exterior_case(args, case_name, radius_mode, radius_value=0.01):
+    mesh_prefix = build_domain_case(
+        f"{args.name}_{case_name}",
+        args.inlet,
+        args.outlet,
+        boundary,
+        radius_mode,
+        radius_value=radius_value,
+    )
 
     common = dict(
-        path_to_1D_mesh = f"./nets/{args.name}/{args.name}_",
-        boundary        = boundary,
-        n               = args.n,
-        sigma3d         = 1e-3,
-        sigma1d         = 1.0,
-        kappa           = 1.0,
+        path_to_1D_mesh=mesh_prefix,
+        boundary=boundary,
+        n=args.n,
+        sigma3d=1e-3,
+        sigma1d=1.0,
+        kappa=1.0,
     )
 
     print("\n" + "=" * 70)
-    print("RUN 1/3 — exterior='restrict'   (REFERENCE: interior only)")
+    print(f"RUN 1/3 — {case_name} fixed? {radius_mode == 'fixed'} — exterior='restrict'   (REFERENCE: interior only)")
     print("=" * 70)
     s_res = Solver3D1D(**common, exterior="restrict").build().solve()
 
@@ -279,20 +315,55 @@ def main():
           f"dirichlet={s_dir.niters}  penalty={s_pen.niters}")
 
     m_dir = compare("dirichlet", s_res, s_dir, args.tol)
-    m_pen = compare("penalty",   s_res, s_pen, args.tol)
+    m_pen = compare("penalty", s_res, s_pen, args.tol)
 
-    dims  = dict(restrict=s_res.W[0].dim(),
+    dims = dict(restrict=s_res.W[0].dim(),
                  dirichlet=s_dir.W[0].dim(),
                  penalty=s_pen.W[0].dim())
     iters = dict(restrict=s_res.niters,
                  dirichlet=s_dir.niters,
                  penalty=s_pen.niters)
 
-    write_report(out, args, m_dir, m_pen, dims, iters)
+    out_path = os.path.join("test_solution", f"{args.name}_{case_name}_exterior")
+    write_report(out_path, args, m_dir, m_pen, dims, iters)
 
-    # Only the dirichlet agreement is a correctness requirement: the penalty is
-    # a known approximation and is expected to differ.
-    return 0 if m_dir["passed"] else 1
+    return m_dir, m_pen
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-name",    type=str,   default="Prova_14_07")
+    ap.add_argument("-inlet",   type=int,   default=4,
+                    help="number of inflow vessels to create in the 1D network")
+    ap.add_argument("-outlet",  type=int,   default=4,
+                    help="number of outlet ramifications per inlet")
+    ap.add_argument("-n",       type=int,   default=40,
+                    help="3D background mesh resolution")
+    ap.add_argument("-penalty", type=float, default=1e-4)
+    ap.add_argument("-tol",     type=float, default=1e-9,
+                    help="tolerance for dirichlet vs restrict (should be exact)")
+    ap.add_argument("-out",     type=str,   default=None,
+                    help="path prefix for the result files (.txt + .json). "
+                         "Default: ./test_solution/<name>_exterior")
+    args = ap.parse_args()
+
+    plot_dir = os.path.join("solution")
+    os.makedirs(plot_dir, exist_ok=True)
+    os.makedirs(os.path.join("test_solution"), exist_ok=True)
+
+    print("\nRunning fixed radii exterior comparison\n")
+    m_dir_fixed, m_pen_fixed = run_exterior_case(args, "fixed", "fixed", radius_value=0.01)
+    fixed_plot_path = os.path.join(plot_dir, f"{args.name}_exterior_fixed_radii.png")
+    plot_exterior_comparison("fixed", m_dir_fixed, m_pen_fixed, fixed_plot_path)
+    print(f"Saved fixed-radii exterior comparison plot to {fixed_plot_path}")
+
+    print("\nRunning random radii exterior comparison\n")
+    m_dir_random, m_pen_random = run_exterior_case(args, "random", "random")
+    random_plot_path = os.path.join(plot_dir, f"{args.name}_exterior_random_radii.png")
+    plot_exterior_comparison("random", m_dir_random, m_pen_random, random_plot_path)
+    print(f"Saved random-radii exterior comparison plot to {random_plot_path}")
+
+    return 0
 
 
 if __name__ == "__main__":

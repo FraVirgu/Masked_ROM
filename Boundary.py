@@ -20,10 +20,10 @@ class Boundary:
 
         self.inlet  = np.array(inlet_points)  if inlet_points  is not None else np.empty((0, 3))
         self.outlet = np.array(outlet_points) if outlet_points is not None else np.empty((0, 3))
-        if(not self.is_inlet_empty() and not self.is_outlet_empty()):
+        if not self.is_inlet_empty() and not self.is_outlet_empty():
             self._border_eps = border_eps
-            self._assert_on_border(self.inlet,  "inlet")
-            self._assert_on_border(self.outlet, "outlet")
+            self._assert_interior_or_border(self.inlet,  "inlet")
+            self._assert_interior_or_border(self.outlet, "outlet")
 
     
     def __call__(self, point) -> bool:
@@ -67,6 +67,12 @@ class Boundary:
         ]
         return any(not inside(n) for n in neighbors)
 
+    def _assert_interior_or_border(self, points, label):
+        for i, p in enumerate(points):
+            assert self(p), (
+                f"{label}[{i}] = {p} is not inside the domain."
+            )
+
     def is_inlet_empty(self):
         return self.inlet.shape[0] == 0
 
@@ -87,11 +93,13 @@ class Boundary:
 
 np.random.seed(42)
 
-def random_sphere_points(n, x_sign, min_x=0.2):
+def random_sphere_points(n, x_sign, min_x=0.2, min_dist_to_boundary=0.06):
     pts = []
+    max_radius = 1.0 - min_dist_to_boundary
     while len(pts) < n:
         v = np.random.randn(3)
-        v = v / np.linalg.norm(v) * 0.9999   # ← just inside, not on boundary
+        v /= np.linalg.norm(v)
+        v *= np.random.uniform(0.0, max_radius)
         if x_sign * v[0] > min_x:
             pts.append(v.tolist())
     return pts
@@ -102,7 +110,7 @@ def random_sphere_points(n, x_sign, min_x=0.2):
 boundary = Boundary(
     source = lambda x, y, z: (x**2 + y**2 + z**2 <= 1.0),
     bbox   = None,
-    inlet_points  = random_sphere_points(40, x_sign=-1),
-    outlet_points = random_sphere_points(40, x_sign=+1),
+    inlet_points  = random_sphere_points(40, x_sign=-1, min_x=0.2, min_dist_to_boundary=0.06),
+    outlet_points = random_sphere_points(40, x_sign=+1, min_x=0.2, min_dist_to_boundary=0.06),
     border_eps = 10e-1
 )

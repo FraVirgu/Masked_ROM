@@ -376,10 +376,13 @@ class Domain:
         edges = edges[~np.array(mask)]
 
         # keep edge only if BOTH endpoints are inside the boundary
-        keep = np.array([
-            self.boundary(vertices[e[0]]) and self.boundary(vertices[e[1]])
-            for e in edges
-        ])
+        if self.boundary is None:
+            keep = np.ones(len(edges), dtype=bool)
+        else:
+            keep = np.array([
+                self.boundary(vertices[e[0]]) and self.boundary(vertices[e[1]])
+                for e in edges
+            ])
         edges = edges[keep]
 
         # (optionally) remove edges inside ellipsoid — uncomment to enable
@@ -421,8 +424,11 @@ class Domain:
         vertices = mesh.coordinates()
         nv_old   = len(vertices)
 
-        if self.boundary.is_inlet_empty():
-            print("WARNING: no inlet points provided, creating based on planes_in")
+        if self.boundary is None or self.boundary.is_inlet_empty():
+            if self.boundary is None:
+                print("WARNING: no boundary provided, creating inlets/outlets from planes")
+            else:
+                print("WARNING: no inlet points provided, creating based on planes_in")
             li, lo   = len(planes_in), len(planes_out)
 
             proj_in  = [None] * li
