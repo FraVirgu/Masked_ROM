@@ -3,14 +3,14 @@
 <Xdmf Version="3.0" xmlns:xi="http://www.w3.org/2001/XInclude">
   <Domain>
     <Grid Name="mesh" GridType="Uniform">
-      <Topology NumberOfElements="866" TopologyType="PolyVertex" NodesPerElement="1">
-        <DataItem Dimensions="866 1" NumberType="UInt" Format="HDF">pressure_noboundary_random_radii.h5:/MeshFunction/0/mesh/topology</DataItem>
+      <Topology NumberOfElements="754" TopologyType="PolyVertex" NodesPerElement="1">
+        <DataItem Dimensions="754 1" NumberType="UInt" Format="HDF">pressure_noboundary_random_radii.h5:/MeshFunction/0/mesh/topology</DataItem>
       </Topology>
       <Geometry GeometryType="XYZ">
-        <DataItem Dimensions="866 3" Format="HDF">pressure_noboundary_random_radii.h5:/MeshFunction/0/mesh/geometry</DataItem>
+        <DataItem Dimensions="754 3" Format="HDF">pressure_noboundary_random_radii.h5:/MeshFunction/0/mesh/geometry</DataItem>
       </Geometry>
       <Attribute Name="radius" AttributeType="Scalar" Center="Cell">
-        <DataItem Dimensions="866 1" Format="HDF">pressure_noboundary_random_radii.h5:/MeshFunction/0/values</DataItem>
+        <DataItem Dimensions="754 1" Format="HDF">pressure_noboundary_random_radii.h5:/MeshFunction/0/values</DataItem>
       </Attribute>
     </Grid>
   </Domain>

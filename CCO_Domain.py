@@ -63,6 +63,44 @@ def boundary_from_obj(obj_path: str, scale: float, center: np.ndarray) -> Bounda
 
 
 # =============================================================================
+# Path helpers
+# =============================================================================
+
+
+def resolve_graph_paths(graph_folder: str, obj_path: str):
+    """Resolve graph and OBJ paths to an existing dataset on disk."""
+
+    candidates = []
+    if graph_folder:
+        candidates.append(graph_folder)
+    candidates.extend(["graph/liver_toy", "graphExport"])
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+
+        if not os.path.isdir(candidate):
+            continue
+
+        required_files = [
+            os.path.join(candidate, "vertex.dat"),
+            os.path.join(candidate, "edges.dat"),
+            os.path.join(candidate, "radius.dat"),
+        ]
+        if all(os.path.exists(path) for path in required_files):
+            resolved_obj = obj_path
+            if not resolved_obj or not os.path.exists(resolved_obj):
+                alt_obj = os.path.join(candidate, "domain.obj")
+                if os.path.exists(alt_obj):
+                    resolved_obj = alt_obj
+            return candidate, resolved_obj
+
+    return graph_folder, obj_path
+
+
+# =============================================================================
 # CCOVascularMesh
 # =============================================================================
 
@@ -75,8 +113,7 @@ class CCOVascularMesh:
     """
 
     def __init__(self, graph_folder: str, obj_path: str, name: str = "cco"):
-        self.graph_folder = graph_folder
-        self.obj_path     = obj_path        # liver domain OBJ → drives scaling
+        self.graph_folder, self.obj_path = resolve_graph_paths(graph_folder, obj_path)
         self.name         = name
         self.output_dir   = os.path.join("nets", name)
 

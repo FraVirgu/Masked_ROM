@@ -36,11 +36,12 @@ def build_domain(case_name, boundary_fn, radius_mode, radius_value=0.01):
 
 
 def solve_case(case_name, boundary_fn, radius_mode, n_values, radius_value=0.01):
-    """Run the solver for every n and return the 3D pressure errors."""
+    """Run the solver for every n and return the 3D pressure errors against an extra n=64 reference."""
     mesh_prefix = build_domain(case_name, boundary_fn, radius_mode, radius_value=radius_value)
 
+    all_ns = list(n_values) + [64]
     solutions = []
-    for n in n_values:
+    for n in all_ns:
         print(f"\n=== {case_name} | n={n} ===")
         solver = Solver3D1D(
             path_to_1D_mesh=mesh_prefix,
@@ -53,15 +54,13 @@ def solve_case(case_name, boundary_fn, radius_mode, n_values, radius_value=0.01)
         ).build().solve()
         solutions.append(solver)
 
-    # Use the finest solve as reference, and compare coarse fields after
-    # interpolating onto the finest mesh.
     ref_solver = solutions[-1]
     V_ref = ref_solver.W[0]
     ref_u = ref_solver.u3d
     dx_ref = Measure("dx", domain=ref_solver.meshV)
 
     errors = []
-    for solver in solutions:
+    for solver in solutions[:-1]:
         u_interp = interpolate(solver.u3d, V_ref)
         diff = ref_u - u_interp
         err = np.sqrt(assemble(diff * diff * dx_ref))

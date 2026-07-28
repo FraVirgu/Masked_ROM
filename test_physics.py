@@ -677,8 +677,8 @@ def sweep_n(boundary, args, ns=(20, 40, 60, 80)):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-name",  type=str,   default="Prova_14_07")
-    ap.add_argument("-graph", type=str,   default="graphExport")
-    ap.add_argument("-obj",   type=str,   default="graphExport/domain.obj")
+    ap.add_argument("-graph", type=str,   default="graph/liver_toy")
+    ap.add_argument("-obj",   type=str,   default="graph/liver_toy/domain.obj")
     ap.add_argument("-n",     type=int,   default=40)
     ap.add_argument("-beta",  type=float, default=5.0,
                     help="Nitsche penalty on the 1D inlet BC")
