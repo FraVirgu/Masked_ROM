@@ -1,6 +1,6 @@
 import os
 
-from CCO_Domain import resolve_graph_paths
+from CCO_DOMAIN import resolve_graph_paths
 
 
 def test_resolve_graph_paths_prefers_existing_liver_toy():

@@ -29,7 +29,7 @@ from dolfin import vertex_to_dof_map
 
 from Boundary import boundary
 from Analytic_Domain import Domain
-from Solver import Solver3D1D
+from Solver_analytic import Solver3D1D
 
 
 def interior_map(s_restrict, s_full):

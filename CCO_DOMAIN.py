@@ -1,25 +1,24 @@
 import os
 import argparse
 import numpy as np
-from dolfin import Mesh, MeshEditor, MeshFunction, XDMFFile, MPI
+from dolfin import Mesh, MeshEditor, MeshFunction, XDMFFile, MPI, BoxMesh, Point, cells
 from scipy.ndimage import binary_fill_holes
 from Boundary import Boundary
-from Solver import Solver3D1D
+from Solver_full_domain import Solver3D1D
 
 
 # =============================================================================
 # Boundary from OBJ
 # =============================================================================
 
-def boundary_from_obj(obj_path: str, scale: float, center: np.ndarray) -> Boundary:
+def boundary_from_obj(obj_path: str, center: np.ndarray | None = None) -> Boundary:
     """
-    Build a Boundary from a voxelized OBJ (liver05Domain.obj).
+    Build a Boundary from an OBJ file without rescaling the geometry.
 
-    Uses the SAME scale/center as CCOVascularMesh so coordinates are
-    consistent with the graph already in [-1,1]^3.
+    The coordinates are translated so the OBJ centroid lies at the origin.
+    The resulting bbox is expressed in the centered coordinate system.
     """
 
-    # --- 1. read OBJ vertices ---
     verts = []
     with open(obj_path) as f:
         for line in f:
@@ -28,33 +27,34 @@ def boundary_from_obj(obj_path: str, scale: float, center: np.ndarray) -> Bounda
                 verts.append([x, y, z])
     verts = np.array(verts)
 
-    # --- 2. voxel indices from half-integer coords ---
-    vmin_vox = np.floor(verts.min(axis=0)).astype(int)
-    vmax_vox = np.floor(verts.max(axis=0)).astype(int)
-    dims     = vmax_vox - vmin_vox + 2   # +2 safe border
+    if center is None:
+        center = (verts.min(axis=0) + verts.max(axis=0)) / 2.0
 
-    # --- 3. mark surface voxels ---
+    verts_centered = verts - center
+
+    vmin_vox = np.floor(verts_centered.min(axis=0)).astype(int)
+    vmax_vox = np.floor(verts_centered.max(axis=0)).astype(int)
+    dims = vmax_vox - vmin_vox + 2
+
     mask = np.zeros(dims, dtype=bool)
-    for v in verts:
+    for v in verts_centered:
         ix = np.clip(int(np.floor(v[0])) - vmin_vox[0], 0, dims[0] - 1)
         iy = np.clip(int(np.floor(v[1])) - vmin_vox[1], 0, dims[1] - 1)
         iz = np.clip(int(np.floor(v[2])) - vmin_vox[2], 0, dims[2] - 1)
         mask[ix, iy, iz] = True
 
-    # --- 4. fill interior ---
     mask = binary_fill_holes(mask)
     print(f"Mask: {mask.shape}, {mask.sum()} inside voxels / {mask.size} total")
 
-    # --- 5. bbox: voxel corners → scaled coords (same transform as graph) ---
-    p_min = (vmin_vox.astype(float)       - center) * scale
-    p_max = ((vmax_vox + 1).astype(float) - center) * scale
-    bbox  = (
+    p_min = vmin_vox.astype(float)
+    p_max = (vmax_vox + 1).astype(float)
+    bbox = (
         (float(p_min[0]), float(p_max[0])),
         (float(p_min[1]), float(p_max[1])),
         (float(p_min[2]), float(p_max[2])),
     )
 
-    print("Boundary bbox (scaled):")
+    print("Boundary bbox (centered):")
     print(f"  x: [{bbox[0][0]:.4f}, {bbox[0][1]:.4f}]  size={bbox[0][1]-bbox[0][0]:.4f}")
     print(f"  y: [{bbox[1][0]:.4f}, {bbox[1][1]:.4f}]  size={bbox[1][1]-bbox[1][0]:.4f}")
     print(f"  z: [{bbox[2][0]:.4f}, {bbox[2][1]:.4f}]  size={bbox[2][1]-bbox[2][0]:.4f}")
@@ -65,7 +65,6 @@ def boundary_from_obj(obj_path: str, scale: float, center: np.ndarray) -> Bounda
 # =============================================================================
 # Path helpers
 # =============================================================================
-
 
 def resolve_graph_paths(graph_folder: str, obj_path: str):
     """Resolve graph and OBJ paths to an existing dataset on disk."""
@@ -101,50 +100,40 @@ def resolve_graph_paths(graph_folder: str, obj_path: str):
 
 
 # =============================================================================
-# CCOVascularMesh
+# CCOVascularMesh (translation-only)
 # =============================================================================
 
 class CCOVascularMesh:
     """
-    Loads a CCO vascular graph (vertex.dat, edges.dat, radius.dat),
-    rescales it to [-1,1]^3 using the DOMAIN (OBJ) bounding box,
-    builds a 1D FEniCS mesh with inlet/outlet markers and per-vertex
-    radii, and exports to XDMF for Solver3D1D.
+    Loads a CCO vascular graph, translates it so the OBJ center lies at the
+    origin, builds a 1D FEniCS mesh with inlet/outlet markers and per-vertex
+    radii, and exports to XDMF for the full-domain solver.
     """
 
     def __init__(self, graph_folder: str, obj_path: str, name: str = "cco"):
         self.graph_folder, self.obj_path = resolve_graph_paths(graph_folder, obj_path)
-        self.name         = name
-        self.output_dir   = os.path.join("nets", name)
+        self.name = name
+        self.output_dir = os.path.join("nets", name)
 
-        # populated by load()
-        self.vertices     = None
-        self.edges        = None
-        self.radii        = None
-        self.scale        = None
-        self.center       = None
+        self.vertices = None
+        self.edges = None
+        self.radii = None
+        self.center = None
 
-        # populated by build()
-        self.mesh1        = None
-        self.inlet        = None
-        self.leaves       = None
-        self.markers      = None
+        self.mesh1 = None
+        self.inlet = None
+        self.leaves = None
+        self.markers = None
         self.vertex_radii = None
-        self.vaso         = None
+        self.vaso = None
         self.vaso_markers = None
-        self.vaso_radii   = None
-
-    # =========================================================================
-    # Public API
-    # =========================================================================
+        self.vaso_radii = None
 
     def load(self):
-        """Load and rescale graph data. Returns self."""
-        self._load_and_rescale()
+        self._load_and_center()
         return self
 
     def build(self):
-        """Build 1D mesh, markers, radii, extract vascular sub-mesh. Returns self."""
         self._require("vertices", "edges", "radii")
         self._build_mesh()
         self._mark_vertices()
@@ -152,18 +141,38 @@ class CCOVascularMesh:
         self._transfer_radii()
         return self
 
+    def build_full_domain(self, n: int = 20):
+        """Build the full 3D domain mesh and the associated cell markers."""
+        self._require("center")
+        boundary = boundary_from_obj(self.obj_path, center=self.center)
+
+        bbox = boundary._bbox
+        (xmin, xmax), (ymin, ymax), (zmin, zmax) = bbox
+        meshV = BoxMesh(Point(xmin, ymin, zmin), Point(xmax, ymax, zmax), n, n, n)
+
+        cell_markers = MeshFunction("size_t", meshV, 3, 111)
+        inside_count = 0
+        for cell in cells(meshV):
+            mp = cell.midpoint()
+            if boundary([mp.x(), mp.y(), mp.z()]):
+                cell_markers[cell] = 222
+                inside_count += 1
+
+        total = meshV.num_cells()
+        print(f"3D mesh: {total} cells | inside domain: {inside_count} ({inside_count / total * 100:.1f}%)")
+        return meshV, cell_markers, boundary
+
     def export_xdmf(self):
-        """Write marked_mesh, markers, radii to nets/{name}/. Returns self."""
         self._require("vaso", "vaso_markers", "vaso_radii")
         os.makedirs(self.output_dir, exist_ok=True)
 
         def path(suffix):
-            return os.path.join(self.output_dir, f"{self.name}_{suffix}.xdmf")
+            return os.path.join(self.output_dir, f"{suffix}.xdmf")
 
         for fname, obj, rename in [
-            ("marked_mesh", self.vaso,         None),
-            ("markers",     self.vaso_markers, None),
-            ("radii",       self.vaso_radii,   ("radius", "vessel radius")),
+            ("marked_mesh", self.vaso, None),
+            ("markers", self.vaso_markers, None),
+            ("radii", self.vaso_radii, ("radius", "vessel radius")),
         ]:
             f = XDMFFile(MPI.comm_world, path(fname))
             f.parameters["flush_output"] = True
@@ -178,14 +187,7 @@ class CCOVascularMesh:
         print(f"  {self.name}_radii.xdmf")
         return self
 
-    # =========================================================================
-    # Private steps
-    # =========================================================================
-
-    def _load_and_rescale(self):
-        """Load graph .dat files and rescale using DOMAIN (OBJ) bbox → [-1,1]^3."""
-
-        # --- graph data ---
+    def _load_and_center(self):
         vertices = {}
         with open(f"{self.graph_folder}/vertex.dat") as f:
             for i, line in enumerate(f):
@@ -221,8 +223,6 @@ class CCOVascularMesh:
                 + "\n".join(f"  vertex {i}: r={r}" for i, r in invalid.items())
             )
 
-        # --- scale/center from DOMAIN bbox (not graph bbox) ---
-        # the domain is always larger than the graph by the CCO border margin
         obj_verts = []
         with open(self.obj_path) as f:
             for line in f:
@@ -231,33 +231,23 @@ class CCOVascularMesh:
                     obj_verts.append([x, y, z])
         obj_verts = np.array(obj_verts)
 
-        vmin   = obj_verts.min(axis=0)
-        vmax   = obj_verts.max(axis=0)
-        center = (vmin + vmax) / 2.0
-        scale  = 2.0 / (vmax - vmin).max()   # domain fits in [-1,1]^3
+        self.center = (obj_verts.min(axis=0) + obj_verts.max(axis=0)) / 2.0
+        self.vertices = {i: v - self.center for i, v in vertices.items()}
+        self.radii = radii
+        self.edges = edges
 
-        self.vertices = {i: (v - center) * scale for i, v in vertices.items()}
-        self.radii    = {i: r * scale             for i, r in radii.items()}
-        self.edges    = edges
-        self.scale    = scale
-        self.center   = center
-
-        # verify graph is strictly inside [-1,1]^3
         g = np.array(list(self.vertices.values()))
         print(f"Loaded {len(vertices)} vertices, {len(edges)} edges")
-        print(f"Domain scale={scale:.6f}, center={np.round(center, 3)}")
-        print("Graph range after scaling:")
+        print(f"Center at origin: {np.round(self.center, 3)}")
+        print("Graph range after centering:")
         print(f"  x=[{g[:,0].min():.4f}, {g[:,0].max():.4f}]  "
               f"y=[{g[:,1].min():.4f}, {g[:,1].max():.4f}]  "
               f"z=[{g[:,2].min():.4f}, {g[:,2].max():.4f}]")
-        print(f"Radii: min={min(self.radii.values()):.6f}  "
-              f"max={max(self.radii.values()):.6f}")
-        assert (g >= -1.0 - 1e-6).all() and (g <= 1.0 + 1e-6).all(), \
-            "Graph vertices outside [-1,1]^3 — check OBJ bbox"
+        print(f"Radii: min={min(self.radii.values()):.6f}  max={max(self.radii.values()):.6f}")
 
     def _build_mesh(self):
         mesh1 = Mesh()
-        me    = MeshEditor()
+        me = MeshEditor()
         me.open(mesh1, "interval", 1, 3)
         me.init_vertices(len(self.vertices))
         me.init_cells(len(self.edges))
@@ -282,8 +272,8 @@ class CCOVascularMesh:
             degree[a] += 1
             degree[b] += 1
 
-        leaves  = [i for i in self.vertices if degree[i] == 1]
-        inlet   = max(leaves, key=lambda i: self.radii[i])
+        leaves = [i for i in self.vertices if degree[i] == 1]
+        inlet = max(leaves, key=lambda i: self.radii[i])
         outlets = [i for i in leaves if i != inlet]
 
         markers = MeshFunction("size_t", self.mesh1, 0, 0)
@@ -295,8 +285,8 @@ class CCOVascularMesh:
             else:
                 markers[i] = 555
 
-        self.inlet   = inlet
-        self.leaves  = outlets
+        self.inlet = inlet
+        self.leaves = outlets
         self.markers = markers
 
         print(f"Inlet: node {inlet} (r={self.radii[inlet]:.4f}) | "
@@ -319,10 +309,9 @@ class CCOVascularMesh:
             for a, b in zip(path[:-1], path[1:]):
                 facet_f[edge_indices[tuple(sorted((a, b)))]] = 1
 
-        self.vaso         = EmbeddedMesh(facet_f, 1)
+        self.vaso = EmbeddedMesh(facet_f, 1)
         self.vaso_markers = transfer_markers(self.vaso, self.markers)
-        print(f"Vaso mesh: {self.vaso.num_vertices()} vertices, "
-              f"{self.vaso.num_cells()} edges")
+        print(f"Vaso mesh: {self.vaso.num_vertices()} vertices, {self.vaso.num_cells()} edges")
 
     def _transfer_radii(self):
         coord_to_radius = {
@@ -330,11 +319,11 @@ class CCOVascularMesh:
             for i in range(self.mesh1.num_vertices())
         }
 
-        vaso_radii     = MeshFunction("double", self.vaso, 0, 0.0)
+        vaso_radii = MeshFunction("double", self.vaso, 0, 0.0)
         fallback_count = 0
         for i in range(self.vaso.num_vertices()):
             key = tuple(np.round(self.vaso.coordinates()[i], 10))
-            r   = coord_to_radius.get(key, None)
+            r = coord_to_radius.get(key, None)
             if r is None or r <= 0:
                 fallback_count += 1
                 vaso_radii[i] = 1e-3
@@ -349,23 +338,15 @@ class CCOVascularMesh:
 
         self.vaso_radii = vaso_radii
 
-    # =========================================================================
-    # Utilities
-    # =========================================================================
-
     def _require(self, *attrs):
         for attr in attrs:
             if getattr(self, attr) is None:
-                raise RuntimeError(
-                    f"'{attr}' not available — call load()/build() first."
-                )
+                raise RuntimeError(f"'{attr}' not available — call load()/build() first.")
 
     def __repr__(self):
         return (
-            f"CCOVascularMesh(graph='{self.graph_folder}', "
-            f"obj='{self.obj_path}', "
-            f"name='{self.name}', "
-            f"built={self.vaso is not None})"
+            f"CCOVascularMesh(graph='{self.graph_folder}', obj='{self.obj_path}', "
+            f"name='{self.name}', built={self.vaso is not None})"
         )
 
 
@@ -374,56 +355,33 @@ class CCOVascularMesh:
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("-name",  type=str,   required=True,
-                        help="subfolder name inside nets/ (e.g. liver05)")
-    parser.add_argument("-graph", type=str,   default="graph/liver_toy",
-                        help="folder with vertex.dat / edges.dat / radius.dat")
-    parser.add_argument("-obj",   type=str,   default="graph/liver_toy/domain.obj",
-                        help="path to liver domain OBJ file")
-    parser.add_argument("-n",     type=int,   default=40,
-                        help="3D mesh resolution")
-    parser.add_argument("-rad",   type=float, default=0.05,
-                        help="coupling radius")
-    parser.add_argument("-sigma1d", type=float, default=1.0,
-                        help="1D conductivity (sigma1d)")
-    parser.add_argument("-sigma3d", type=float, default=1e-3,
-                        help="3D conductivity (sigma3d)")
-    parser.add_argument("-kappa", type=float, default=1.0,
-                        help="coupling coefficient (kappa)")
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-name", type=str, required=True, help="subfolder name inside nets/ (e.g. liver05)")
+    parser.add_argument("-graph", type=str, default="graph/liver_toy", help="folder with vertex.dat / edges.dat / radius.dat")
+    parser.add_argument("-obj", type=str, default="graph/liver_toy/domain.obj", help="path to liver domain OBJ file")
+    parser.add_argument("-n", type=int, default=100, help="3D mesh resolution")
+    parser.add_argument("-rad", type=float, default=0.05, help="unused legacy argument kept for compatibility")
+    parser.add_argument("-sigma1d", type=float, default=12.0, help="1D conductivity (geometry-scaled starting value)")
+    parser.add_argument("-sigma3d", type=float, default=1e-3, help="3D conductivity (geometry-scaled starting value)")
+    parser.add_argument("-kappa", type=float, default=1.0, help="coupling coefficient (geometry-scaled starting value)")
+    parser.add_argument("-beta", type=float, default=100.0, help="Nitsche inlet penalty (beta)")
     args = parser.parse_args()
 
-    # --- 1. build vascular mesh (domain OBJ drives scaling) ---
-    cco = CCOVascularMesh(
-        graph_folder = args.graph,
-        obj_path     = args.obj,
-        name         = args.name,
-    )
+    cco = CCOVascularMesh(graph_folder=args.graph, obj_path=args.obj, name=args.name)
     cco.load().build().export_xdmf()
 
-    # --- 2. build boundary (same scale/center as graph) ---
-    boundary_cco = boundary_from_obj(
-        obj_path = args.obj,
-        scale    = cco.scale,
-        center   = cco.center,
+    meshV, cell_markers, boundary = cco.build_full_domain(n=args.n)
+    solver = Solver3D1D(
+        path_to_1D_mesh=os.path.join("nets", args.name) + os.sep,
+        full_domain_mesh=meshV,
+        full_domain_markers=cell_markers,
+        boundary=boundary,
+        n=args.n,
+        sigma3d=args.sigma3d,
+        sigma1d=args.sigma1d,
+        kappa=args.kappa,
+        beta_nitsche=args.beta,
     )
-
-    # --- 3. run solver ---
-    out_dir = (
-        f"./solution/CCO{args.name}_n{args.n}"
-        f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}"
-    )
-    solver  = Solver3D1D(
-        path_to_1D_mesh = f"./nets/{args.name}/{args.name}_",
-        boundary        = boundary_cco,
-        n               = args.n,
-        sigma3d         = args.sigma3d,
-        sigma1d         = args.sigma1d,
-        kappa           = args.kappa,
-    ).build().solve()
-
-    solver.save(out_dir)
-    solver.save_paraview(f"{out_dir}/paraview")
-    
+    solver.build()
+    solver.solve()
+    solver.save_paraview(os.path.join("solution", args.name))

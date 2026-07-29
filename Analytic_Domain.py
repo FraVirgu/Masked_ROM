@@ -7,7 +7,7 @@ from dolfin import (
     XDMFFile, MPI, cells
 )
 from Boundary import Boundary, boundary
-from Solver import Solver3D1D  # noqa: local import
+from Solver_analytic import Solver3D1D  # noqa: local import
 
 class Domain:
     """

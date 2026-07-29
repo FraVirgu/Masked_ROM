@@ -3,14 +3,14 @@
 <Xdmf Version="3.0" xmlns:xi="http://www.w3.org/2001/XInclude">
   <Domain>
     <Grid Name="mesh" GridType="Uniform">
-      <Topology NumberOfElements="533" TopologyType="PolyVertex" NodesPerElement="1">
-        <DataItem Dimensions="533 1" NumberType="UInt" Format="HDF">Prova_14_07_fixed_markers.h5:/MeshFunction/0/mesh/topology</DataItem>
+      <Topology NumberOfElements="465" TopologyType="PolyVertex" NodesPerElement="1">
+        <DataItem Dimensions="465 1" NumberType="UInt" Format="HDF">Prova_14_07_fixed_markers.h5:/MeshFunction/0/mesh/topology</DataItem>
       </Topology>
       <Geometry GeometryType="XYZ">
-        <DataItem Dimensions="533 3" Format="HDF">Prova_14_07_fixed_markers.h5:/MeshFunction/0/mesh/geometry</DataItem>
+        <DataItem Dimensions="465 3" Format="HDF">Prova_14_07_fixed_markers.h5:/MeshFunction/0/mesh/geometry</DataItem>
       </Geometry>
       <Attribute Name="f" AttributeType="Scalar" Center="Cell">
-        <DataItem Dimensions="533 1" Format="HDF">Prova_14_07_fixed_markers.h5:/MeshFunction/0/values</DataItem>
+        <DataItem Dimensions="465 1" Format="HDF">Prova_14_07_fixed_markers.h5:/MeshFunction/0/values</DataItem>
       </Attribute>
     </Grid>
   </Domain>

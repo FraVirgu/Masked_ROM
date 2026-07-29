@@ -38,8 +38,8 @@ import os
 import numpy as np
 from dolfin import assemble, Constant, dx, Function, vertex_to_dof_map
 
-from CCO_Domain import CCOVascularMesh, boundary_from_obj
-from Solver import Solver3D1D
+from CCO_DOMAIN import CCOVascularMesh, boundary_from_obj
+from Solver_analytic import Solver3D1D
 
 
 P_IN = 1.0   # inlet value hardcoded in Solver._assemble_system

@@ -47,7 +47,7 @@ from scipy.sparse import csr_matrix
 from xii import Circle
 from xii.assembler.average_matrix import average_matrix as xii_average_matrix
 
-from Solver import average_matrix_diff_radii
+from Solver_analytic import average_matrix_diff_radii
 
 
 def to_csr(petsc_mat, shape):

@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from dolfin import Measure, assemble, interpolate, dx
 
 from Analytic_Domain import Domain
-from Solver import Solver3D1D
+from Solver_analytic import Solver3D1D
 
 
 def build_full_domain(case_name, radius_value=0.01):

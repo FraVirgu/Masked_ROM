@@ -24,7 +24,7 @@ from dolfin import (BoxMesh, Point, FunctionSpace, Function, Mesh, XDMFFile,
                     MeshFunction, interpolate, Expression, cells)
 from scipy.sparse import csr_matrix
 
-from Solver import average_matrix_diff_radii
+from Solver_analytic import average_matrix_diff_radii
 
 
 def main():
