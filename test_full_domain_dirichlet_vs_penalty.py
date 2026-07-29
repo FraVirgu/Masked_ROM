@@ -5,7 +5,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from dolfin import Measure, assemble, interpolate, dx
 
-from Domain import Domain
+from Analytic_Domain import Domain
 from Solver import Solver3D1D
 
 

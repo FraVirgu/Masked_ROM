@@ -28,7 +28,7 @@ import numpy as np
 from dolfin import vertex_to_dof_map
 
 from Boundary import boundary
-from Domain import Domain
+from Analytic_Domain import Domain
 from Solver import Solver3D1D
 
 

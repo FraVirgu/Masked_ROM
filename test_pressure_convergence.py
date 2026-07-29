@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from dolfin import Function, FunctionSpace, Measure, assemble, interpolate, dx
 
 from Boundary import boundary
-from Domain import Domain
+from Analytic_Domain import Domain
 from Solver import Solver3D1D
 
 
