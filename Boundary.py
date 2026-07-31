@@ -90,27 +90,67 @@ class Boundary:
         return f"Boundary(mode={self._mode!r})"
 
 
+class SphereBoundary(Boundary):
+    def __init__(
+        self,
+        radius=1.0,
+        center=(0.0, 0.0, 0.0),
+        inlet_points=None,
+        outlet_points=None,
+        border_eps=1e-2,
+    ):
+        self.radius = float(radius)
+        self.center = np.asarray(center, dtype=float)
+        if self.radius <= 0.0:
+            raise ValueError("radius must be positive for SphereBoundary.")
+
+        cx, cy, cz = self.center
+        r = self.radius
+        # Keep compatibility with code paths that expect boundary._bbox.
+        self._bbox = ((cx - r, cx + r), (cy - r, cy + r), (cz - r, cz + r))
+
+        super().__init__(
+            source=lambda x, y, z: (
+                (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2 <= self.radius ** 2
+            ),
+            bbox=None,
+            inlet_points=inlet_points,
+            outlet_points=outlet_points,
+            border_eps=border_eps,
+        )
+
+    def __repr__(self):
+        return (
+            f"SphereBoundary(radius={self.radius!r}, "
+            f"center={tuple(self.center)!r})"
+        )
+
+
 
 np.random.seed(42)
 
-def random_sphere_points(n, x_sign, min_x=0.2, min_dist_to_boundary=0.06):
+def random_sphere_points(
+    n,
+    x_sign,
+    min_x=0.2,
+    min_dist_to_boundary=0.06,
+    radius=1.0,
+):
     pts = []
-    max_radius = 1.0 - min_dist_to_boundary
+    radius = float(radius)
+    if radius <= 0.0:
+        raise ValueError("radius must be positive when sampling sphere points.")
+    max_radius = radius - min_dist_to_boundary
+    if max_radius <= 0.0:
+        raise ValueError(
+            "min_dist_to_boundary must be smaller than the sphere radius."
+        )
     while len(pts) < n:
         v = np.random.randn(3)
         v /= np.linalg.norm(v)
         v *= np.random.uniform(0.0, max_radius)
-        if x_sign * v[0] > min_x:
+        if x_sign * v[0] > min_x * radius:
             pts.append(v.tolist())
     return pts
 
 
-
-
-boundary = Boundary(
-    source = lambda x, y, z: (x**2 + y**2 + z**2 <= 1.0),
-    bbox   = None,
-    inlet_points  = random_sphere_points(40, x_sign=-1, min_x=0.2, min_dist_to_boundary=0.06),
-    outlet_points = random_sphere_points(40, x_sign=+1, min_x=0.2, min_dist_to_boundary=0.06),
-    border_eps = 10e-1
-)

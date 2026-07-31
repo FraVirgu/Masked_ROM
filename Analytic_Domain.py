@@ -6,8 +6,7 @@ from dolfin import (
     Mesh, MeshEditor, MeshFunction, File, Point, BoxMesh,
     XDMFFile, MPI, cells
 )
-from Boundary import Boundary, boundary
-from Solver_analytic import Solver3D1D  # noqa: local import
+from Boundary import Boundary, random_sphere_points
 
 class Domain:
     """
@@ -27,6 +26,10 @@ class Domain:
         n_points_per_layer: int | list[int] = 1690,
         num_points_in: int = 560,
         num_points_out: int = 560,
+        radius_mean: float = 0.01,
+        radius_std: float = 0.003,
+        radius_min: float = 0.003,
+        radius_max: float = 0.05,
         boundary: Boundary | None = None
     ):
         # --- identity & bounds ---
@@ -62,6 +65,21 @@ class Domain:
         # --- vessel topology ---
         self.n_vasi          = n_vasi
         self.n_ramifications = n_ramifications
+
+        # --- vessel radii distribution ---
+        if radius_std < 0.0:
+            raise ValueError("radius_std must be non-negative.")
+        if radius_min <= 0.0:
+            raise ValueError("radius_min must be positive.")
+        if radius_min > radius_max:
+            raise ValueError("radius_min must be <= radius_max.")
+        if not (radius_min <= radius_mean <= radius_max):
+            raise ValueError("radius_mean must lie in [radius_min, radius_max].")
+
+        self.radius_mean = float(radius_mean)
+        self.radius_std = float(radius_std)
+        self.radius_min = float(radius_min)
+        self.radius_max = float(radius_max)
 
         # --- derived (populated by build()) ---
         self.base_pts     = None
@@ -234,7 +252,14 @@ class Domain:
         """Extract the vascular network via shortest paths between inlet/outlet markers."""
         self._require("mesh1D", "markers")
         self.vaso, self.vaso_markers, self.vaso_radii = self._fun(
-            self.mesh1D, self.n_vasi, self.n_ramifications, self.markers
+            self.mesh1D,
+            self.n_vasi,
+            self.n_ramifications,
+            self.markers,
+            self.radius_mean,
+            self.radius_std,
+            self.radius_min,
+            self.radius_max,
         )
         print(f"N DOF vaso: {self.vaso.num_edges()}")
 
@@ -522,22 +547,27 @@ class Domain:
 
         return mesh1, markers
 
-    def _fun(self, mesh, n_departures, n_arrivals, markers):
+    def _fun(
+        self,
+        mesh,
+        n_departures,
+        n_arrivals,
+        markers,
+        radius_mean,
+        radius_std,
+        radius_min,
+        radius_max,
+    ):
         import networkx as nx
         from xii import EmbeddedMesh, transfer_markers
 
         facet_f = MeshFunction("size_t", mesh, 1, 0)
         mesh.init(1, 0)
 
-        R_MEAN = 0.01    # 10 µm — reference capillary radius
-        R_STD  = 0.003   # physiological spread
-        R_MIN  = 0.003   # smallest capillary
-        R_MAX  = 0.05    # largest arteriole
-
-        vertex_radii = MeshFunction("double", mesh, 0, R_MEAN)
+        vertex_radii = MeshFunction("double", mesh, 0, radius_mean)
         for i in range(mesh.num_vertices()):
-            r = np.random.normal(R_MEAN, R_STD)
-            vertex_radii[i] = float(np.clip(r, R_MIN, R_MAX))
+            r = np.random.normal(radius_mean, radius_std)
+            vertex_radii[i] = float(np.clip(r, radius_min, radius_max))
         
         G             = nx.Graph()
         edge_indices  = {}
@@ -602,79 +632,3 @@ class Domain:
         )
     
 
-
-
-
-# =============================================================================
-# Entry point
-# =============================================================================
-
-if __name__ == "__main__":
-    import os
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Build a simple analytic (non-OpenCCO) vascular domain and "
-                    "solve the 3D-1D problem with the no-penalty solver.",
-    )
-    parser.add_argument("-name",   type=str, required=True,
-                        help="subfolder name inside nets/ (e.g. sphere01)")
-    parser.add_argument("-inlet",  type=int, default=4,
-                        help="number of inflow vessels (n_vasi)")
-    parser.add_argument("-outlet", type=int, default=4,
-                        help="ramifications per vessel (n_ramifications)")
-    parser.add_argument("-n",      type=int, default=20,
-                        help="3D background mesh resolution")
-    parser.add_argument("-sigma1d", type=float, default=1.0,
-                        help="1D conductivity (sigma1d)")
-    parser.add_argument("-sigma3d", type=float, default=1e-3,
-                        help="3D conductivity (sigma3d)")
-    parser.add_argument("-kappa", type=float, default=1.0,
-                        help="coupling coefficient (kappa)")
-    args = parser.parse_args()
-
-    # nets/{name}/ holds every mesh file this run writes and the solver reads.
-    #
-    # Domain's export_* methods build filenames as f"{self.name}_marked_mesh.xdmf"
-    # (i.e. they add the trailing '_'), while the solver reads them back as
-    # f"{path_to_1D_mesh}marked_mesh.xdmf" (no added '_'). So self.name must NOT
-    # end in '_', and path_to_1D_mesh MUST — otherwise the underscores don't line
-    # up and the solver looks for a file the domain never wrote.
-    net_dir = os.path.join("nets", args.name)
-    os.makedirs(net_dir, exist_ok=True)
-    name_stem = os.path.join(net_dir, args.name)   # nets/NAME/NAME      (no trailing _)
-    mesh_prefix = f"{name_stem}_"                   # nets/NAME/NAME_     (solver prefix)
-
-    # --- 1. build the analytic-boundary domain (unit sphere from Boundary.py) ---
-    domain = Domain(
-        name            = name_stem,
-        n_vasi          = args.inlet,
-        n_ramifications = args.outlet,
-        boundary        = boundary,
-    ).build()
-
-    domain.export_box()
-    domain.export_reticolo()
-    domain.export_vaso()
-    domain.export_xdmf()
-
-    # --- 2. run the solver WITHOUT the boundary penalty ---
-    # exterior='dirichlet' eliminates the exterior DOFs exactly instead of
-    # pinning them with a penalty term, so the interface is not contaminated.
-    out_dir = (
-        f"./solution/Simple{args.name}_n{args.n}"
-        f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}"
-    )
-    solver  = Solver3D1D(
-        path_to_1D_mesh = mesh_prefix,
-        boundary        = boundary,
-        n               = args.n,
-        sigma3d         = args.sigma3d,
-        sigma1d         = args.sigma1d,
-        kappa           = args.kappa,
-        exterior        = "dirichlet",
-    ).build().solve()
-
-    solver.save(out_dir)
-    solver.save_paraview(f"{out_dir}/paraview")

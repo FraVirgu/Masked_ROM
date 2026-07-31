@@ -133,10 +133,11 @@ class Solver3D1D:
         beta_nitsche: float = 5000.0,
         inlet_tag: int = 111,
         exterior: str = "dirichlet",
-        penalty: float = 1.0,
     ):
-        if exterior not in ("penalty", "restrict", "dirichlet"):
-            raise ValueError(f"exterior must be 'penalty', 'restrict' or 'dirichlet', got {exterior!r}.")
+        if exterior != "dirichlet":
+            raise ValueError(
+                f"Solver3D1D now supports only exterior='dirichlet', got {exterior!r}."
+            )
 
         self.path_to_1D_mesh = path_to_1D_mesh
         self.full_domain_mesh = full_domain_mesh
@@ -148,11 +149,6 @@ class Solver3D1D:
         self.kappa = kappa
         self.beta_nitsche = beta_nitsche
         self.inlet_tag = inlet_tag
-
-        self.exterior = exterior
-        self.penalty = penalty
-        if exterior == "penalty" and penalty <= 0.0:
-            raise ValueError("penalty must be > 0 with exterior='penalty'.")
 
         self.meshV = None
         self.meshQ = None
@@ -297,13 +293,6 @@ class Solver3D1D:
             total = self.meshV.num_cells()
             print(f"3D mesh: {total} cells | inside domain: {inside_count} ({inside_count / total * 100:.1f}%)")
 
-        if self.exterior == "restrict":
-            submesh = SubMesh(self.meshV, self.V_cell_markers, 222)
-            self.parent_vertex = submesh.data().array("parent_vertex_indices", 0).copy()
-            self.meshV = submesh
-            self.V_cell_markers = MeshFunction("size_t", self.meshV, 3, 222)
-            print(f"3D mesh restricted to interior: {self.meshV.num_cells()} cells | {self.meshV.num_vertices()} vertices")
-
         self.d_omega = Measure("dx", domain=self.meshV, subdomain_data=self.V_cell_markers)
 
         self.meshQ = Mesh()
@@ -330,6 +319,40 @@ class Solver3D1D:
         self.ds = Measure("ds", domain=self.meshQ, subdomain_data=self.Q_markers)
 
         print(f"1D mesh: {self.meshQ.num_cells()} edges | {self.meshQ.num_vertices()} vertices")
+        self._print_node_radius_ranges()
+
+    def _print_node_radius_ranges(self):
+        """Print the global node-radius interval over the 1D graph."""
+        n_v = self.meshQ.num_vertices()
+        if n_v == 0:
+            print("Node radii: empty 1D mesh")
+            return
+
+        node_min = np.full(n_v, np.inf, dtype=float)
+        node_max = np.full(n_v, -np.inf, dtype=float)
+        r_vertex = np.asarray(self.Q_radii.array(), dtype=float)
+
+        for a, b in self.meshQ.cells():
+            a = int(a)
+            b = int(b)
+            r_edge = 0.5 * (r_vertex[a] + r_vertex[b])
+            if r_edge < node_min[a]:
+                node_min[a] = r_edge
+            if r_edge > node_max[a]:
+                node_max[a] = r_edge
+            if r_edge < node_min[b]:
+                node_min[b] = r_edge
+            if r_edge > node_max[b]:
+                node_max[b] = r_edge
+
+        # Fallback for isolated vertices: interval collapses to nodal value.
+        isolated = ~np.isfinite(node_min)
+        node_min[isolated] = r_vertex[isolated]
+        node_max[isolated] = r_vertex[isolated]
+
+        r_min = float(node_min.min())
+        r_max = float(node_max.max())
+        print(f"Node radii (1D graph): r belongs [{r_min:.6f}, {r_max:.6f}]")
 
     def _assemble_system(self):
         self._require("meshV", "meshQ", "ds", "Q_radii")
@@ -340,8 +363,7 @@ class Solver3D1D:
         self.V_DOF = V.dofmap().global_dimension()
         print(f"3D DOFs: {self.V_DOF} | 1D DOFs: {Q.dofmap().global_dimension()}")
 
-        if self.exterior == "dirichlet":
-            self._find_exterior_dofs(V)
+        self._find_exterior_dofs(V)
 
         u, v = TrialFunction(V), TestFunction(V)
         p, q = TrialFunction(Q), TestFunction(Q)
@@ -352,7 +374,6 @@ class Solver3D1D:
         h_E = MaxCellEdgeLength(self.meshQ)
         n_fct = FacetNormal(self.meshQ)
         p_in = Constant(5.0)
-        u_out = Constant(0.0)
         dx_ = Measure("dx", domain=self.meshQ)
 
         n_V = V.dofmap().global_dimension()
@@ -362,21 +383,20 @@ class Solver3D1D:
         indptr, idx, data_ = C_petsc.getValuesCSR()
         C = csr_matrix((data_, idx, indptr), shape=(n_Q, n_V))
 
-        if self.exterior == "dirichlet":
-            is_ext = np.zeros(n_V, dtype=bool)
-            is_ext[self.ext_dofs] = True
+        is_ext = np.zeros(n_V, dtype=bool)
+        is_ext[self.ext_dofs] = True
 
-            Ccoo = C.tocoo()
-            drop = is_ext[Ccoo.col]
-            lost = np.abs(Ccoo.data[drop]).sum()
+        Ccoo = C.tocoo()
+        drop = is_ext[Ccoo.col]
+        lost = np.abs(Ccoo.data[drop]).sum()
 
-            C = csr_matrix(
-                (Ccoo.data[~drop], (Ccoo.row[~drop], Ccoo.col[~drop])),
-                shape=C.shape,
-            )
-            C.eliminate_zeros()
-            self.C_dropped = float(lost)
-            print(f"C: zeroed {len(self.ext_dofs)} exterior columns (dropped weight {lost:.3e})")
+        C = csr_matrix(
+            (Ccoo.data[~drop], (Ccoo.row[~drop], Ccoo.col[~drop])),
+            shape=C.shape,
+        )
+        C.eliminate_zeros()
+        self.C_dropped = float(lost)
+        print(f"C: zeroed {len(self.ext_dofs)} exterior columns (dropped weight {lost:.3e})")
 
         self.C = C
 
@@ -418,8 +438,6 @@ class Solver3D1D:
             k3 * inner(grad(u), grad(v)) * self.d_omega(222)
             + k3 * inner(u, v) * self.d_omega(222)
         )
-        if self.exterior == "penalty":
-            a[0][0] += Constant(self.penalty) * inner(u, v) * self.d_omega(111)
 
         a[1][1] = k1_f * inner(grad(p), grad(q)) * dx_ + (
             -inner(dot(grad(p), n_fct), q) * ds(tag, domain=self.meshQ)
@@ -427,8 +445,6 @@ class Solver3D1D:
             + beta * (h_E ** -1) * inner(p, q) * ds(tag, domain=self.meshQ)
         )
         L[0] = inner(Constant(0), v) * self.d_omega(222)
-        if self.exterior == "penalty":
-            L[0] += Constant(self.penalty) * inner(u_out, v) * self.d_omega(111)
         L[1] = (
             -inner(p_in, dot(grad(q), n_fct)) * ds(tag, domain=self.meshQ)
             + beta * (h_E ** -1) * inner(p_in, q) * ds(tag, domain=self.meshQ)
@@ -437,8 +453,7 @@ class Solver3D1D:
         self.AD = ii_assemble(a)
         self.b = ii_assemble(L)
 
-        if self.exterior == "dirichlet":
-            self._eliminate_exterior(self.AD, self.b)
+        self._eliminate_exterior(self.AD, self.b)
         self.A = self.AD + self.M
         print("System assembled.")
 
