@@ -361,10 +361,10 @@ if __name__ == "__main__":
     parser.add_argument("-obj", type=str, default="graph/liver_toy/domain.obj", help="path to liver domain OBJ file")
     parser.add_argument("-n", type=int, default=100, help="3D mesh resolution")
     parser.add_argument("-rad", type=float, default=0.05, help="unused legacy argument kept for compatibility")
-    parser.add_argument("-sigma1d", type=float, default=12.0, help="1D conductivity (geometry-scaled starting value)")
+    parser.add_argument("-sigma1d", type=float, default=10.0, help="1D conductivity (geometry-scaled starting value)")
     parser.add_argument("-sigma3d", type=float, default=1e-3, help="3D conductivity (geometry-scaled starting value)")
     parser.add_argument("-kappa", type=float, default=1.0, help="coupling coefficient (geometry-scaled starting value)")
-    parser.add_argument("-beta", type=float, default=100.0, help="Nitsche inlet penalty (beta)")
+    parser.add_argument("-beta", type=float, default=50.0, help="Nitsche inlet penalty (beta)")
     args = parser.parse_args()
 
     cco = CCOVascularMesh(graph_folder=args.graph, obj_path=args.obj, name=args.name)

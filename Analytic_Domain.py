@@ -620,11 +620,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("-name",   type=str, required=True,
                         help="subfolder name inside nets/ (e.g. sphere01)")
-    parser.add_argument("-inlet",  type=int, default=4,
+    parser.add_argument("-inlet",  type=int, default=10,
                         help="number of inflow vessels (n_vasi)")
-    parser.add_argument("-outlet", type=int, default=4,
+    parser.add_argument("-outlet", type=int, default=10,
                         help="ramifications per vessel (n_ramifications)")
-    parser.add_argument("-n",      type=int, default=20,
+    parser.add_argument("-n",      type=int, default=30,
                         help="3D background mesh resolution")
     parser.add_argument("-sigma1d", type=float, default=1.0,
                         help="1D conductivity (sigma1d)")
