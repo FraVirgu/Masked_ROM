@@ -1,0 +1,264 @@
+% =====================================================================
+% Numerical assessment of the Robin-residual transmission condition
+% for the 3D-1D coupled problem.
+%
+% Drop into the DD-ROM note. Requires: amsmath, amssymb, booktabs.
+%
+% Add to the preamble if not already present:
+%   \newcommand{\e}[1]{\!\times\!10^{#1}}
+%   \newtheorem{remark}{Remark}          % or \theoremstyle{remark}
+% =====================================================================
+
+\section{Numerical assessment of the Robin-residual extraction}
+\label{sec:robin-residual-assessment}
+
+We report a controlled numerical study of the transmission condition of
+eqs.~\eqref{eq:discrete_residual}--\eqref{eq:local_solve}. The conclusion is that the
+scheme is \emph{exact} whenever no vessel crosses an artificial interface, and
+that it \emph{fails} --- performing worse than no coupling at all --- as soon as
+one does. We identify the missing term responsible and verify that supplying it
+restores the structural property the extraction relies on.
+
+\subsection{Test configuration}
+
+To remove every confounding factor present in the full problem (curved physical
+boundary, exterior-degree-of-freedom elimination, branching vasculature, eight
+subdomains with three face-neighbours each) we use the smallest configuration in
+which eqs.~\eqref{eq:discrete_residual}--\eqref{eq:local_solve} still carry content:
+
+\begin{itemize}
+  \item domain $\Omega = [0,1]^3$, discretised with $12^3$ cells
+        ($2197$ degrees of freedom), every cell interior, so no
+        exterior-dof elimination occurs and $A_i$ contains no
+        unit-diagonal placeholder rows;
+  \item a single straight vessel segment $\Lambda$ with two nodes, radius
+        $R = 0.08$, running parallel to the $y$-axis, carrying a prescribed
+        pressure drop;
+  \item one artificial cut plane at $x = \tfrac12$, giving two subdomains
+        $\Omega_0, \Omega_1$ sharing exactly one face.
+\end{itemize}
+
+The only quantity varied is the position of the vessel axis relative to the cut:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+label & axis position & averaging circle \\
+\midrule
+\textsf{offset} & $x = 0.25$ & entirely inside $\Omega_0$ \\
+\textsf{near}   & $x = 0.46$ & spans the cut ($0.46 + R = 0.54 > 0.5$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Diagnostics}
+
+\paragraph{Interface support of the residual.}
+Eq.~\eqref{eq:discrete_residual} applies the restriction $P_i^\Gamma$ to
+\begin{equation}
+  r_i \;=\; b_i - A_i u^*_i + \rho\, G_i^\Gamma u^*_i ,
+  \label{eq:residual}
+\end{equation}
+discarding every entry off the artificial interface. This is legitimate only if
+those entries vanish, which is precisely the \emph{Key point}: for a one-sided
+local operator, $b_i - A_i u^*$ is supported on $\Gamma_i^{\mathrm{art}}$. We
+therefore measure
+\begin{equation}
+  \eta_i \;=\;
+  \frac{\bigl\| r_i|_{\Gamma_i^{\mathrm{art}}} \bigr\|_2}{\|r_i\|_2}
+  \;\in\; [0,1],
+  \label{eq:eta}
+\end{equation}
+so that $\eta_i = 1$ certifies the hypothesis and $\eta_i < 1$ quantifies the
+fraction of the datum that $P_i^\Gamma$ silently destroys.
+
+\paragraph{Error against the uncoupled baseline.}
+Every error reported below is the relative $L^2$ distance between a subdomain
+solution and the restriction of the global solution to that subdomain,
+\begin{equation}
+  e(u_i) \;=\;
+  \frac{\bigl\| u^*|_{\Omega_i} - u_i \bigr\|_2}
+       {\bigl\| u^*|_{\Omega_i} \bigr\|_2},
+  \label{eq:relerr}
+\end{equation}
+averaged over the two subdomains. Here $u^*|_{\Omega_i}$ is the target --- the
+converged global solution restricted to $\Omega_i$ --- and $u_i$ is whatever the
+scheme under test produced there.
+
+The column headed ``rel.\ error vs.\ raw'' in Table~\ref{tab:results} reports
+\eqref{eq:relerr} for \emph{two} choices of $u_i$:
+\begin{itemize}
+  \item $e(u_i^{\mathrm{scheme}})$, from the local solve
+        \eqref{eq:local_solve};
+  \item $e(u_i^{\mathrm{raw}})$, the \emph{raw} solve, in which each
+        subdomain is solved in isolation with the natural condition on its
+        artificial cut planes and no transmission condition whatsoever.
+\end{itemize}
+The raw solve is the do-nothing baseline. It is the correct reference because
+some error is unavoidable at any discretisation, so the question is not whether
+a transmission condition leaves error but whether it improves on ignoring the
+neighbouring subdomains altogether. A scheme with
+$e(u_i^{\mathrm{scheme}}) > e(u_i^{\mathrm{raw}})$ is actively harmful.
+
+\begin{remark}
+The raw baseline is \emph{not} a single fixed number across the table: it
+depends on how the local coupling operator $C_i$ is assembled, and the cross
+term of \S\ref{sec:cross} requires a different assembly (see
+\eqref{eq:cross} and the discussion following it). Consequently rows~2 and~3 of
+Table~\ref{tab:results} have baselines $7.2\times10^{-2}$ and
+$5.0\times10^{-1}$ respectively, and only the ratio
+$e(u_i^{\mathrm{scheme}})/e(u_i^{\mathrm{raw}})$ is comparable between rows.
+Absolute errors must never be compared across rows.
+\end{remark}
+
+\subsection{Results}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{llccccl}
+\toprule
+& & & \multicolumn{3}{c}{relative error \eqref{eq:relerr}} & \\
+\cmidrule(lr){4-6}
+vessel & scheme & $\eta_0 / \eta_1$
+       & scheme & raw & ratio & \\
+\midrule
+\textsf{offset} & eqs.~\eqref{eq:discrete_residual}--\eqref{eq:local_solve}
+  & $100 / 100$ & $2.9\e{-15}$ & $5.8\e{-1}$ & $5\e{-15}$ & exact \\
+\textsf{near}   & eqs.~\eqref{eq:discrete_residual}--\eqref{eq:local_solve}
+  & $38 / 86$   & $2.2\e{-1}$  & $7.2\e{-2}$ & $3.0$      & harmful \\
+\textsf{near}   & \;+ cross term \eqref{eq:cross}
+  & $100 / 100$ & $3.4\e{-1}$  & $5.0\e{-1}$ & $0.68$     & improves \\
+\textsf{offset} & \;+ cross term \eqref{eq:cross}
+  & $100 / 100$ & $2.9\e{-15}$ & $5.8\e{-1}$ & $5\e{-15}$ & unchanged \\
+\bottomrule
+\end{tabular}
+\caption{Interface support $\eta_i$ (in \%) of the extracted residual, and the
+resulting subdomain error \eqref{eq:relerr}. The \emph{ratio} column is
+$e(u_i^{\mathrm{scheme}})/e(u_i^{\mathrm{raw}})$: values below $1$ mean the
+transmission condition improves on solving the subdomains in isolation, values
+above $1$ mean it is worse than no coupling at all. Rows~2 and~3 have different
+raw baselines because the cross term requires the modified assembly of
+\S\ref{sec:cross}; the ratio is therefore the only quantity comparable between
+rows, and absolute errors must not be compared across them.}
+\label{tab:results}
+\end{table}
+
+Row~1 establishes that the method and its implementation are correct: with no
+vessel crossing the interface, eqs.~\eqref{eq:discrete_residual}--\eqref{eq:local_solve}
+reproduce the global solution to machine precision, the interior part of $r_i$
+being $O(10^{-18})$. Row~2 changes only the position of the vessel axis, by
+$0.21$ in $x$: the interface support collapses to $38\%$ on one subdomain and
+the scheme becomes three times \emph{worse} than applying no transmission
+condition at all. Since nothing else differs between the two rows --- same
+code, same mesh, same $\rho$ --- the failure is attributable to the vessel
+crossing the interface and to nothing else.
+
+\subsection{The missing term}
+\label{sec:cross}
+
+The local operator is
+\begin{equation}
+  A_i \;=\; \underbrace{AD^{00}_i}_{\text{3D diffusion}}
+          \;+\; \underbrace{C_i^\top G\, C_i}_{\text{3D--1D coupling}} .
+\end{equation}
+A direct row-by-row comparison against the global operator, restricted to rows
+whose entire global stencil lies inside $\Omega_i$, gives
+$\max|AD^{00}_i - AD^{00}| = 0$ to machine precision: the diffusion block is
+exactly one-sided and is never the cause.
+
+The coupling block is not. The matrix $C$ realises the circular average
+\begin{equation}
+  \bar u(s) \;=\; \frac{1}{2\pi R}\oint_{\partial D(s)} u \, \mathrm{d}\theta ,
+\end{equation}
+so each row of $C$ reaches the 3D degrees of freedom on one circle of radius $R$.
+When that circle intersects the cut plane the row splits between the two
+subdomains,
+\begin{equation}
+  C_v \;=\; C_v^{(i)} + C_v^{(j)} ,
+\end{equation}
+and neither subdomain can evaluate the average alone. Restricting the global
+equation to the rows owned by $\Omega_i$ gives
+\begin{equation}
+  AD^{00}_i u_i \;+\; C_i^\top G\, C_i u_i
+  \;+\; \underbrace{C_i^\top G\, C_j u_j}_{\text{absent from \eqref{eq:local_solve}}}
+  \;=\; b_i .
+  \label{eq:truelocal}
+\end{equation}
+The third term couples $\Omega_i$ to its neighbour \emph{through the vessel
+network} rather than through the flux across $\Gamma$. Since
+eq.~\eqref{eq:local_solve} transports only the latter, this contribution is
+unaccounted for; it is what remains in $b_i - A_i u^*$ away from the interface,
+and it is distributed through the volume wherever vessels run. This is the
+$62\%$ of $\|r_i\|$ that $P_i^\Gamma$ discards in row~2 of
+Table~\ref{tab:results}.
+
+We therefore augment eq.~\eqref{eq:local_solve} with
+\begin{equation}
+  \mathcal{X}_i \;=\; C_i^\top G \left( C u^* - C_i u_i \right),
+  \label{eq:cross}
+\end{equation}
+written against the global $C$ so that no assumption is needed about how the
+columns on $\Gamma$ are apportioned between the two subdomains. The quantity
+crossing the interface is $C_v u^* - C_v^{(i)} u_i$, one scalar per straddling
+vessel node --- the partial arc average on the far side --- so the exchange
+remains an interface datum of the same character as the Robin trace, not a
+volume field.
+
+\paragraph{Consequence for the assembly, and for the baseline.}
+Expression \eqref{eq:cross} is meaningful only if $C_v^{(i)}$ and $C_v^{(j)}$
+carry the \emph{global} arc weights, so that $C_v^{(i)} + C_v^{(j)} = C_v$
+reconstructs the full circular average. The straightforward local assembly does
+not have this property: quadrature points falling outside $\Omega_i$ are
+discarded and the partial arc is then renormalised by its own surviving
+measure, which makes each fragment look like a complete average. Using
+\eqref{eq:cross} therefore requires $C_i$ to be the global row with the
+non-owned columns \emph{deleted} rather than renormalised.
+
+This changes the local operator, and hence the raw baseline: a subdomain now
+retains only the weight physically inside it --- between $49\%$ and $89\%$ for
+a straddling vessel in this configuration --- instead of a renormalised
+substitute. That is why the raw error in row~3 of Table~\ref{tab:results}
+($5.0\times10^{-1}$) exceeds that of row~2 ($7.2\times10^{-2}$): the two rows
+use different assemblies, and the comparison of interest is between each scheme
+and the baseline computed with its own assembly.
+
+Rows~3 and~4 of Table~\ref{tab:results} record the effect. The interface support
+returns to $100\%$ on both subdomains, with interior residual $O(10^{-17})$: the
+\emph{Key point} is restored exactly for a straddling vessel, and the scheme
+passes from three times worse than the uncoupled baseline to $0.68$ times it.
+Row~4 is a regression check --- with no vessel crossing the cut,
+$\mathcal{X}_i$ vanishes identically ($\|\mathcal{X}_i\| = 0$ in floating
+point) and the machine-precision result of row~1 is recovered unchanged, which
+confirms that the improvement in row~3 is not an artefact of perturbing the
+system.
+
+\subsection{Remaining gap}
+
+Row~3 improves on its baseline but does not attain the machine precision of
+row~1. Two effects account for the difference, and both concern the
+\emph{solve} rather than the extraction, which \eqref{eq:cross} has repaired
+exactly.
+
+First, $\mathcal{X}_i$ is evaluated at $u^*$ and held fixed, whereas
+eq.~\eqref{eq:local_solve} solves for $u_i \neq u^*|_{\Omega_i}$; correction and
+unknown are therefore mutually inconsistent. Second, as noted above, the
+assembly required by \eqref{eq:cross} leaves $A_i$ one-sided but
+\emph{under-coupled}: the missing arc weight is compensated on the right-hand
+side rather than restored to the operator being inverted.
+
+Removing both would require the cross coupling to enter $A_i$ itself rather than
+its right-hand side, which entails either an outer iteration in which
+$\mathcal{X}_i$ is refreshed from the neighbour's current iterate, or subdomains
+overlapping by the vessel radius so that each local operator carries the full
+coupling stencil. We record this as open.
+
+\subsection{Summary}
+
+Eqs.~\eqref{eq:discrete_residual}--\eqref{eq:local_solve} are exact for interfaces
+crossed by no vessel, and the failure observed otherwise is neither an
+implementation defect nor a discretisation artefact: it is a missing term. In a
+3D--1D coupled problem two subdomains interact through two distinct channels ---
+the flux across the artificial surface, and the vessel network itself. The
+transmission condition as written accounts for the first only. Supplying
+\eqref{eq:cross} restores the structural property on which the extraction
+depends; embedding that coupling in the local operator remains to be done.

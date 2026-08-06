@@ -179,6 +179,8 @@ class SolverPartitionDomain:
         gamma=1.0,
         interior_tag=222,
         f3d=0.0,
+        C_global=None,
+        l2g=None,
     ):
         self.meshV = meshV
         self.meshV_markers = meshV_markers
@@ -186,6 +188,10 @@ class SolverPartitionDomain:
         self.q_radii = q_radii
         self.p_known = p_known
         self.active_q_vertices = active_q_vertices
+        # Optional: restrict the GLOBAL coupling operator to this box's columns
+        # instead of rebuilding it by local circle quadrature. See build().
+        self.C_global = C_global
+        self.l2g = None if l2g is None else np.asarray(l2g, dtype=int)
         self.sigma3d = float(sigma3d)
         self.kappa = float(kappa)
         self.gamma = float(gamma)
@@ -209,6 +215,9 @@ class SolverPartitionDomain:
         self.u3d = None
         self.skipped_q_vertices = None
         self.active_q_vertices_count = 0
+        self.C_restriction_dropped = None
+        self.C_restriction_kept = None
+        self.C_rows_straddling = None
 
     def build(self):
         self.V = FunctionSpace(self.meshV, "CG", 1)
@@ -230,20 +239,65 @@ class SolverPartitionDomain:
         self.b0 = assemble(b0_form)
 
         q_radii_arr = self._as_q_radii_array(self.q_radii)
-        C_petsc, skipped = average_matrix_diff_radii_skip(
-            self.V,
-            self.Q,
-            q_radii_arr,
-            active_vertices=self.active_q_vertices,
-        )
-        self.skipped_q_vertices = skipped
-        if self.active_q_vertices is None:
-            self.active_q_vertices_count = int(self.meshQ.num_vertices())
-        else:
-            self.active_q_vertices_count = int(np.asarray(self.active_q_vertices).size)
 
-        c_indptr, c_idx, c_data = C_petsc.getValuesCSR()
-        self.C = csr_matrix((c_data, c_idx, c_indptr), shape=(self.Q.dim(), self.V.dim()))
+        if self.C_global is not None and self.l2g is not None:
+            # --- restricted global C -----------------------------------------
+            # Local circle quadrature drops quadrature points that fall outside
+            # this box and RENORMALIZES by the surviving arc (used_measure in
+            # average_matrix_diff_radii_skip). For a vessel whose circle
+            # straddles a cut plane that yields a genuinely different average of
+            # the same field than the global operator computed -- measured at
+            # 77% relative discrepancy -- so A_i is not the one-sided
+            # restriction of the global operator and b_i - A_i u* picks up a
+            # volume term wherever vessels live. That breaks the Key point
+            # eq. (4) relies on.
+            #
+            # Restricting the global C to this box's columns instead keeps every
+            # surviving weight EXACTLY as the global solve computed it. The
+            # meshQ is shared across subdomains (decomposeDomain hands every box
+            # the same global meshQ), so rows need no mapping at all -- this is
+            # a pure column selection.
+            Cg = self.C_global.tocsr()
+            n_V_local = self.V.dim()
+            Ccoo = Cg.tocoo()
+            # Global column -> local column, -1 where the box does not own it.
+            g2l = -np.ones(Cg.shape[1], dtype=np.int64)
+            g2l[self.l2g] = np.arange(self.l2g.size)
+            mapped = g2l[Ccoo.col]
+            keep = mapped >= 0
+            self.C = csr_matrix(
+                (Ccoo.data[keep], (Ccoo.row[keep], mapped[keep])),
+                shape=(self.Q.dim(), n_V_local),
+            )
+            self.C.eliminate_zeros()
+
+            # Weight lost to columns outside the box: this is the part of each
+            # vessel's circular average that lives in a NEIGHBOUR. It is exactly
+            # the 1D-network coupling across the cut, and it is not local data.
+            self.C_restriction_dropped = float(np.abs(Ccoo.data[~keep]).sum())
+            self.C_restriction_kept = float(np.abs(Ccoo.data[keep]).sum())
+            # Rows with any weight outside the box -- vertices whose circle
+            # straddles a cut plane.
+            rows_out = np.unique(Ccoo.row[~keep])
+            rows_in = np.unique(Ccoo.row[keep])
+            self.C_rows_straddling = np.intersect1d(rows_out, rows_in)
+            self.skipped_q_vertices = []
+            self.active_q_vertices_count = int(rows_in.size)
+        else:
+            C_petsc, skipped = average_matrix_diff_radii_skip(
+                self.V,
+                self.Q,
+                q_radii_arr,
+                active_vertices=self.active_q_vertices,
+            )
+            self.skipped_q_vertices = skipped
+            if self.active_q_vertices is None:
+                self.active_q_vertices_count = int(self.meshQ.num_vertices())
+            else:
+                self.active_q_vertices_count = int(np.asarray(self.active_q_vertices).size)
+
+            c_indptr, c_idx, c_data = C_petsc.getValuesCSR()
+            self.C = csr_matrix((c_data, c_idx, c_indptr), shape=(self.Q.dim(), self.V.dim()))
 
         p = TrialFunction(self.Q)
         q = TestFunction(self.Q)
@@ -280,6 +334,14 @@ class SolverPartitionDomain:
                 f"skipped {len(self.skipped_q_vertices)} graph vertices "
                 f"(out of {self.active_q_vertices_count} active) "
                 "with no 3D support in this partition mesh."
+            )
+        if getattr(self, "C_restriction_dropped", None) is not None:
+            tot = self.C_restriction_kept + self.C_restriction_dropped
+            print(
+                "Coupling operator C (restricted from global): "
+                f"{self.active_q_vertices_count} rows with local support, "
+                f"{self.C_rows_straddling.size} straddling a cut, "
+                f"weight kept {self.C_restriction_kept / max(tot, 1e-30):.1%}"
             )
 
         return self

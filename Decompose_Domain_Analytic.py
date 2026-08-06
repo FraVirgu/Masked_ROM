@@ -6,7 +6,6 @@ import math
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
-from scipy.sparse.linalg import spsolve, splu
 
 from dolfin import (
     BoxMesh,
@@ -23,7 +22,6 @@ from dolfin import (
     assemble,
     as_backend_type,
 )
-from xii import ii_convert
 
 from Solver_full_domain import Solver3D1D
 from Solver_partition_domain import SolverPartitionDomain
@@ -121,37 +119,6 @@ def matrix_to_csr(A_any):
     raise TypeError(f"Unsupported matrix type for CSR conversion: {type(A_any)!r}")
 
 
-def compute_robin(solver, rho_robin=1.0):
-    """Compute full-mesh Robin residual ingredients and rhs vector."""
-    V, _ = solver.W
-
-    # Full-mesh 3D blocks and vectors used by the Robin residual formula.
-    A3 = matrix_to_csr(solver.A[0][0])
-
-    # G is the plain 3D volume mass matrix on V (not the 3D-1D coupling block).
-    u_mass, v_mass = TrialFunction(V), TestFunction(V)
-    G3_dolfin = assemble(inner(u_mass, v_mass) * solver.d_omega(222))
-    G3 = matrix_to_csr(G3_dolfin)
-
-    b0 = solver.b[0]
-    if isinstance(b0, np.ndarray):
-        b3 = b0.astype(float, copy=True).ravel()
-    elif hasattr(b0, "get_local"):
-        b3 = b0.get_local()
-    else:
-        b3 = ii_convert(b0).get_local()
-    u3_star = solver.u3d.vector().get_local()
-
-    robin_rhs = b3 - A3.dot(u3_star) + float(rho_robin) * G3.dot(u3_star)
-    return {
-        "A3": A3,
-        "G3": G3,
-        "b3": b3,
-        "u3_star": u3_star,
-        "robin_rhs": robin_rhs,
-    }
-
-
 ARTIFICIAL_FACET_TAG = 77
 
 
@@ -197,10 +164,16 @@ def mark_artificial_facets(partition_solver, g_min, g_max, tol=1e-9):
 
 def assemble_robin_interface(partition_solver, facet_markers):
     """
-    Assemble the Robin interface mass matrix M_gamma = \\int_{Gamma_art} u v ds
-    on the tagged artificial facets of one subdomain.
+    Assemble G_i^Gamma, the artificial-interface mass matrix of eqs. (4)-(5):
 
-    This is a SURFACE integral on the cut planes -- not a volume mass matrix.
+        (G_i^Gamma)_kl = \\int_{Gamma_i^art} phi_k phi_l ds
+
+    on the facets tagged by mark_artificial_facets.
+
+    This is a SURFACE integral on the cut planes -- not a volume mass matrix,
+    despite the shape. Rows and columns of dofs that touch no artificial facet
+    are identically zero, so G_i^Gamma is supported entirely on the interface.
+
     Because it enters the bilinear form (and its product with a trace enters the
     linear form), both sides stay dimensionally consistent: the correction is a
     state-type quantity, never a load added onto a solution.
@@ -211,11 +184,13 @@ def assemble_robin_interface(partition_solver, facet_markers):
     ds_art = Measure(
         "ds", domain=partition_solver.meshV, subdomain_data=facet_markers
     )
-    M_dolfin = assemble(inner(u, v) * ds_art(ARTIFICIAL_FACET_TAG))
-    return matrix_to_csr(M_dolfin)
+    G_dolfin = assemble(inner(u, v) * ds_art(ARTIFICIAL_FACET_TAG))
+    return matrix_to_csr(G_dolfin)
 
 
-def eliminate_exterior_local(partition_solver, interior_tag=222):
+def eliminate_exterior_local(
+    partition_solver, interior_tag=222, global_ext_mask=None, l2g=None
+):
     """
     Apply the same exterior-dof elimination that Solver3D1D does, to one
     subdomain system, in place.
@@ -225,6 +200,16 @@ def eliminate_exterior_local(partition_solver, interior_tag=222):
     dropped, replaced by a unit diagonal, and its rhs zeroed, pinning u=0 there
     exactly as the full-domain solve does.
 
+    If `global_ext_mask` (a boolean array over global dofs) and `l2g` are given,
+    the classification is INHERITED from the global solve instead of being
+    recomputed locally. This matters: the local BoxMesh tetrahedralizes
+    boundary-straddling cells differently from the global mesh, so the local
+    midpoint test disagrees with the global one near the sphere surface. Dofs
+    the box eliminates but the global solve keeps carry a substantial u* (up to
+    0.35 measured), and since elimination drops their columns, A_i u* silently
+    ignores that data and fabricates a residual -- which breaks eq. (4)'s
+    extraction with no warning.
+
     Returns (n_ext, n_int).
     """
     V = partition_solver.V
@@ -233,13 +218,36 @@ def eliminate_exterior_local(partition_solver, interior_tag=222):
     dm = V.dofmap()
     n = V.dim()
 
+    # Local support: a dof only has a row in A_i if some cell touching it is
+    # marked interior, because a00_form integrates over d_omega(interior_tag)
+    # alone. A dof with no locally-interior cell has an all-zero row.
     has_int = np.zeros(n, dtype=bool)
     for cell in cells(mesh):
         if markers[cell] == interior_tag:
             has_int[dm.cell_dofs(cell.index())] = True
 
-    ext_dofs = np.flatnonzero(~has_int)
-    int_dofs = np.flatnonzero(has_int)
+    is_ext_local = ~has_int
+
+    if global_ext_mask is not None and l2g is not None:
+        # Eliminate the UNION: globally-exterior dofs (so A_i drops exactly what
+        # the global operator drops, keeping u* zero there) PLUS dofs with no
+        # local interior support (whose rows are identically zero -- keeping
+        # them makes A_i exactly singular).
+        is_ext_global = np.asarray(global_ext_mask, dtype=bool)[
+            np.asarray(l2g, dtype=int)
+        ]
+        # Dofs the global solve keeps but this box cannot support. These are
+        # unavoidable: u* is nonzero there, yet A_i has no equation for them,
+        # so eq. (4)'s residual will pick up a term the transfer cannot carry.
+        partition_solver.unsupported_interior = np.flatnonzero(
+            is_ext_local & ~is_ext_global
+        )
+        is_ext_local = is_ext_local | is_ext_global
+    else:
+        partition_solver.unsupported_interior = np.zeros(0, dtype=int)
+
+    ext_dofs = np.flatnonzero(is_ext_local)
+    int_dofs = np.flatnonzero(~is_ext_local)
 
     if ext_dofs.size == 0:
         partition_solver.ext_dofs = ext_dofs
@@ -269,368 +277,42 @@ def eliminate_exterior_local(partition_solver, interior_tag=222):
     return int(ext_dofs.size), int(int_dofs.size)
 
 
-def solve_schwarz_robin(
-    subdomains,
-    solver,
-    rho_robin=None,
-    max_iter=30,
-    tol=1e-6,
-    print_summary=True,
+def solve_partition_domain(
+    subdomains, solver, print_summary=True, restrict_global_C=False
 ):
+    """Solve each subdomain in isolation and attach diagnostics.
+
+    This is the "raw" baseline: every box is solved with the natural (Neumann)
+    condition on its artificial cut planes, i.e. with no coupling to its
+    neighbours. It is the reference any transmission scheme is measured
+    against, and the starting point they improve on.
+
+    It must run before any of them: it populates "partition_solver" and the
+    per-subdomain error fields they read.
+
+    restrict_global_C=True builds each box's coupling operator by restricting
+    the GLOBAL C to that box's columns, instead of re-running circle quadrature
+    on the local mesh. The local quadrature clips circles at the box boundary
+    and renormalizes by the surviving arc, which makes C_i disagree with the
+    global operator by ~77% and destroys the one-sidedness eq. (4) assumes.
     """
-    Additive Schwarz iteration with a Robin transmission condition on the
-    artificial cut planes.
-
-    Per subdomain the system is
-
-        (A_local + rho * M_gamma) u^(k+1) = rhs_local + rho * M_gamma u_nbr^(k)
-
-    The Robin term is added to the matrix ONCE: A_local + rho*M_gamma is
-    assembled and LU-factorized a single time, outside the loop. Only the
-    right-hand side changes between sweeps, refreshed from the neighbours'
-    current interface traces. This is why iterating reduces the error -- on the
-    first sweep u_nbr^(0) = 0 carries no information, and coupling between boxes
-    only propagates on later sweeps.
-
-    Uses the previous iterate's trace, never the ground-truth field, so this is
-    a scheme that would work with an unknown target.
-    """
-    V_global = solver.W[0]
-    n_global = V_global.dim()
-
-    if rho_robin is None:
-        # Standard Robin scaling rho ~ sigma3d / h.
-        hmax = solver.meshV.hmax() if hasattr(solver, "meshV") else 1.0
-        rho_robin = float(solver.sigma3d) / max(float(hmax), 1e-30)
-
-    coords_global = V_global.tabulate_dof_coordinates().reshape((n_global, -1))
-    g_min = coords_global.min(axis=0)
-    g_max = coords_global.max(axis=0)
-
-    # ---- one-time setup: Robin term into the matrix, then factorize ----------
-    states = []
-    for subdomain in subdomains:
-        ps = subdomain["partition_solver"]
-        facet_markers, n_tagged = mark_artificial_facets(ps, g_min, g_max)
-        M_gamma = assemble_robin_interface(ps, facet_markers)
-
-        # Exterior dofs stay pinned to u=0: drop their Robin rows/cols so the
-        # transmission condition never reactivates them.
-        ext_dofs = getattr(ps, "ext_dofs", None)
-        if ext_dofs is not None and np.size(ext_dofs):
-            keep = np.ones(M_gamma.shape[0], dtype=bool)
-            keep[np.asarray(ext_dofs, dtype=int)] = False
-            D = csr_matrix(
-                (keep.astype(float), (np.arange(keep.size), np.arange(keep.size))),
-                shape=M_gamma.shape,
-            )
-            M_gamma = D @ M_gamma @ D
-
-        A_robin = (ps.A + rho_robin * M_gamma).tocsc()
-        states.append({
-            "subdomain": subdomain,
-            "ps": ps,
-            "M_gamma": M_gamma,
-            "lu": splu(A_robin),
-            "rhs_local": np.array(ps.rhs, dtype=float),
-            "l2g": subdomain["local_to_global_dof"],
-            "n_tagged_facets": n_tagged,
-            "u": np.zeros(ps.V.dim(), dtype=float),
-        })
-        subdomain["schwarz_n_artificial_facets"] = n_tagged
-
-    # ---- iterate: only the rhs changes --------------------------------------
-    u3d_full_vec = solver.u3d.vector().get_local()
-    full_ref_l2 = float(np.linalg.norm(u3d_full_vec))
-    history = []
-
-    for it in range(1, max_iter + 1):
-        # Global trace field from the current iterates (averaged on overlaps).
-        acc = np.zeros(n_global, dtype=float)
-        cnt = np.zeros(n_global, dtype=float)
-        for st in states:
-            acc[st["l2g"]] += st["u"]
-            cnt[st["l2g"]] += 1.0
-        u_glob = np.zeros(n_global, dtype=float)
-        nz = cnt > 0.0
-        u_glob[nz] = acc[nz] / cnt[nz]
-
-        delta = 0.0
-        for st in states:
-            u_nbr = u_glob[st["l2g"]]
-            rhs = st["rhs_local"] + rho_robin * (st["M_gamma"] @ u_nbr)
-            u_new = st["lu"].solve(rhs)
-            delta = max(delta, float(np.linalg.norm(u_new - st["u"])))
-            st["u_next"] = u_new
-        for st in states:
-            st["u"] = st["u_next"]
-
-        # Reconstruct and measure against the full-domain reference.
-        acc = np.zeros(n_global, dtype=float)
-        cnt = np.zeros(n_global, dtype=float)
-        for st in states:
-            acc[st["l2g"]] += st["u"]
-            cnt[st["l2g"]] += 1.0
-        rec = np.zeros(n_global, dtype=float)
-        nz = cnt > 0.0
-        rec[nz] = acc[nz] / cnt[nz]
-        rec[~nz] = u3d_full_vec[~nz]
-
-        rel_glob = (
-            float(np.linalg.norm(u3d_full_vec - rec)) / full_ref_l2
-            if full_ref_l2 > 0.0
-            else 0.0
-        )
-        rel_loc = []
-        for st in states:
-            uf = st["subdomain"]["sol_3d_sub"].vector().get_local()
-            nf = float(np.linalg.norm(uf))
-            rel_loc.append(
-                float(np.linalg.norm(uf - st["u"])) / nf if nf > 1e-12 else 0.0
-            )
-        rel_loc_avg = float(np.mean(rel_loc))
-        history.append((it, delta, rel_loc_avg, rel_glob))
-
-        if delta < tol:
-            break
-
-    for st in states:
-        sd = st["subdomain"]
-        fn = Function(st["ps"].V)
-        fn.vector()[:] = st["u"]
-        sd["u3d_partition_schwarz"] = fn
-        uf = sd["sol_3d_sub"].vector().get_local()
-        nf = float(np.linalg.norm(uf))
-        sd["u3d_partition_error_schwarz_norm_l2"] = float(np.linalg.norm(uf - st["u"]))
-        sd["u3d_partition_error_schwarz_rel_l2"] = (
-            sd["u3d_partition_error_schwarz_norm_l2"] / nf if nf > 1e-12 else 0.0
-        )
-
-    if print_summary and history:
-        n_facets = np.array([st["n_tagged_facets"] for st in states], dtype=float)
-        print("")
-        print("Additive Schwarz / Robin iteration:")
-        print(
-            f"  rho_robin={rho_robin:.4e}  max_iter={max_iter}  tol={tol:.1e}  "
-            f"artificial facets/subdomain: min={int(n_facets.min())} "
-            f"max={int(n_facets.max())}"
-        )
-        print("  iter |   delta    | avg rel local | rel global")
-        for it, delta, rl, rg in history:
-            print(f"  {it:4d} | {delta:.4e} | {rl:.6e}  | {rg:.6e}")
-        final_loc = history[-1][2]
-        final_glob = history[-1][3]
-        raw_loc = float(
-            np.mean([
-                sd["u3d_partition_error_local_raw_rel_l2"] for sd in subdomains
-            ])
-        )
-        print(
-            f"  raw (no transmission) avg rel local: {raw_loc:.6e}"
-            f"  ->  Schwarz: {final_loc:.6e}"
-        )
-        if final_loc > 1e-14:
-            print(f"  improvement over raw: {raw_loc / final_loc:.2f}x")
-        print(f"  final reconstructed global rel error: {final_glob:.6e}")
-
-    return history
-
-
-def diagnose_exact_dirichlet(subdomains, solver, print_summary=True):
-    """
-    Step-1 diagnostic: re-solve each subdomain with EXACT Dirichlet data taken
-    from the full-domain solution on the artificial cut planes.
-
-    This is an offline upper-bound check, not a usable scheme: it consumes the
-    ground-truth field `solver.u3d`, which is unknown in production. Its only
-    purpose is to answer one question -- is the ~40% local error caused by the
-    missing inter-subdomain transmission condition, or by something else?
-
-    Interpretation
-    --------------
-    err_dirichlet << err_raw  ->  the error IS the missing transmission
-        condition. A converged Schwarz/Robin iteration can recover roughly
-        this much, and `err_dirichlet` is the floor it converges to.
-    err_dirichlet ~= err_raw  ->  the error is NOT (only) the interface. Look
-        instead at the coupling operator C, the skipped graph vertices, or the
-        local operator itself. Building a Schwarz loop would be wasted effort.
-
-    Only faces on an artificial cut are constrained. Faces that lie on the
-    global mesh boundary are left with whatever natural condition the local
-    form implies, matching how the full-domain solve treats them.
-    """
-    V_global = solver.W[0]
-    u3_star = solver.u3d.vector().get_local()
-
-    coords_global = V_global.tabulate_dof_coordinates().reshape((V_global.dim(), -1))
-    g_min = coords_global.min(axis=0)
-    g_max = coords_global.max(axis=0)
-
-    results = []
-
-    for subdomain in subdomains:
-        V_sub = subdomain["V_sub"]
-        local_to_global_dof = subdomain["local_to_global_dof"]
-        sub_coords = V_sub.tabulate_dof_coordinates().reshape((V_sub.dim(), -1))
-
-        # Guard: the local reference is built by point-evaluation while
-        # local_to_global_dof is an exact index map. If these disagree, every
-        # error number below is polluted, so fail loudly instead of reporting.
-        u_full_local = subdomain["sol_3d_sub"].vector().get_local()
-        u_mapped = u3_star[local_to_global_dof]
-        map_mismatch = float(np.max(np.abs(u_full_local - u_mapped)))
-        ref_scale = max(float(np.max(np.abs(u_full_local))), 1e-30)
-        if map_mismatch / ref_scale > 1e-8:
-            raise RuntimeError(
-                f"Subdomain {subdomain['ijk']}: sol_3d_sub disagrees with "
-                f"u3_star[local_to_global_dof] (max abs diff {map_mismatch:.3e}, "
-                f"rel {map_mismatch / ref_scale:.3e}). The dof map or the "
-                "point-evaluation reference is wrong; diagnostic aborted."
-            )
-
-        # Reuse the exact same local operator/rhs as the raw path, so the only
-        # difference between err_raw and err_dirichlet is the interface data.
-        partition_solver = subdomain["partition_solver"]
-        A_local = partition_solver.A.tolil(copy=True)
-        rhs_local = np.array(partition_solver.rhs, dtype=float)
-
-        # Identify artificial-cut boundary dofs: on a face of the local box,
-        # but not on the corresponding face of the global mesh.
-        tol = 1e-9
-        sub_lo = sub_coords.min(axis=0)
-        sub_hi = sub_coords.max(axis=0)
-        on_artificial = np.zeros(V_sub.dim(), dtype=bool)
-        for axis in range(3):
-            at_lo = np.abs(sub_coords[:, axis] - sub_lo[axis]) < tol
-            at_hi = np.abs(sub_coords[:, axis] - sub_hi[axis]) < tol
-            if abs(sub_lo[axis] - g_min[axis]) > tol:
-                on_artificial |= at_lo
-            if abs(sub_hi[axis] - g_max[axis]) > tol:
-                on_artificial |= at_hi
-
-        # Never constrain an eliminated exterior dof: it is already pinned to
-        # u=0 by the elimination, and overwriting its row would reintroduce the
-        # PDE outside the physical domain.
-        ext_dofs = getattr(partition_solver, "ext_dofs", None)
-        if ext_dofs is not None and np.size(ext_dofs):
-            on_artificial[np.asarray(ext_dofs, dtype=int)] = False
-
-        dirichlet_dofs = np.where(on_artificial)[0]
-
-        # Impose u = u_star on those dofs by row replacement.
-        for d in dirichlet_dofs:
-            A_local.rows[d] = [int(d)]
-            A_local.data[d] = [1.0]
-            rhs_local[d] = u_mapped[d]
-
-        u_dirichlet = spsolve(A_local.tocsr(), rhs_local)
-
-        err_dirichlet = u_full_local - u_dirichlet
-        err_dirichlet_l2 = float(np.linalg.norm(err_dirichlet))
-        full_local_norm = float(np.linalg.norm(u_full_local))
-        rel_dirichlet = err_dirichlet_l2 / full_local_norm if full_local_norm > 1e-12 else 0.0
-
-        u_dirichlet_fn = Function(V_sub)
-        u_dirichlet_fn.vector()[:] = u_dirichlet
-
-        subdomain["u3d_partition_dirichlet"] = u_dirichlet_fn
-        subdomain["u3d_partition_error_dirichlet_norm_l2"] = err_dirichlet_l2
-        subdomain["u3d_partition_error_dirichlet_rel_l2"] = rel_dirichlet
-        subdomain["dirichlet_dof_count"] = int(dirichlet_dofs.size)
-        subdomain["dirichlet_interior_dof_count"] = int(V_sub.dim() - dirichlet_dofs.size)
-
-        results.append({
-            "ijk": subdomain["ijk"],
-            "rel_raw": subdomain["u3d_partition_error_local_raw_rel_l2"],
-            "rel_dirichlet": rel_dirichlet,
-            "n_dirichlet": int(dirichlet_dofs.size),
-        })
-
-    if print_summary and results:
-        rel_raw = np.array([r["rel_raw"] for r in results], dtype=float)
-        rel_dir = np.array([r["rel_dirichlet"] for r in results], dtype=float)
-        print("")
-        print("Step-1 diagnostic (exact Dirichlet on artificial cut planes):")
-        print(
-            "  relative local error, raw (Neumann cuts):      "
-            f"min={rel_raw.min():.3e} max={rel_raw.max():.3e} avg={rel_raw.mean():.3e}"
-        )
-        print(
-            "  relative local error, exact-Dirichlet cuts:    "
-            f"min={rel_dir.min():.3e} max={rel_dir.max():.3e} avg={rel_dir.mean():.3e}"
-        )
-        if rel_dir.mean() > 1e-14:
-            print(f"  error reduction factor (avg): {rel_raw.mean() / rel_dir.mean():.1f}x")
-        print("  per-subdomain (ijk: raw -> dirichlet, #constrained dofs):")
-        for r in sorted(results, key=lambda x: -x["rel_raw"]):
-            print(
-                f"    {r['ijk']}: {r['rel_raw']:.3e} -> {r['rel_dirichlet']:.3e} "
-                f"({r['n_dirichlet']} dofs)"
-            )
-
-        # Judge on the reduction factor, not an absolute floor: the question is
-        # whether the interface is the dominant remaining error, not whether the
-        # floor has reached discretization error (other defects also raise it).
-        verdict_floor = rel_dir.mean()
-        reduction = rel_raw.mean() / verdict_floor if verdict_floor > 1e-14 else np.inf
-        if reduction >= 3.0:
-            print(
-                "  VERDICT: interface data dominates the remaining error "
-                f"({reduction:.1f}x reduction). A converged Schwarz/Robin iteration "
-                f"targets ~{verdict_floor:.1%} relative error. The floor itself is "
-                "set by the other error sources (coupling operator C, skipped graph "
-                "vertices, discretization) and bounds what any transmission "
-                "condition can achieve."
-            )
-        elif reduction >= 1.5:
-            print(
-                f"  VERDICT: mixed ({reduction:.1f}x reduction). The interface matters "
-                "but is not dominant; expect only partial gains from a Schwarz loop "
-                "until the floor is lowered."
-            )
-        else:
-            print(
-                "  VERDICT: exact interface data does NOT recover the solution "
-                f"({reduction:.1f}x reduction). The dominant error is elsewhere "
-                "(coupling operator C, skipped graph vertices, or the local "
-                "operator). Do not build the Schwarz loop yet."
-            )
-
-    return results
-
-
-def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True):
-    """Apply full-mesh Robin rhs to each partition and attach diagnostics."""
-    robin_data = compute_robin(solver, rho_robin=rho_robin)
-    A3 = robin_data["A3"]
-    G3 = robin_data["G3"]
-    b3 = robin_data["b3"]
-    u3_star = robin_data["u3_star"]
-    robin_rhs = robin_data["robin_rhs"]
-
     V_global = solver.W[0]
     n_global = V_global.dim()
     u_partition_sum_raw = np.zeros(n_global, dtype=float)
     u_partition_count_raw = np.zeros(n_global, dtype=float)
-    u_partition_sum = np.zeros(n_global, dtype=float)
-    u_partition_count = np.zeros(n_global, dtype=float)
+
+    # Inherit the exterior classification from the global solve so that each
+    # A_i eliminates exactly the dofs the global operator eliminates. Deriving
+    # it locally disagrees near the sphere surface (different tetrahedra), which
+    # leaves u* nonzero on locally-eliminated dofs.
+    global_ext_mask = None
+    g_ext = getattr(solver, "ext_dofs", None)
+    if g_ext is not None and np.size(g_ext):
+        global_ext_mask = np.zeros(n_global, dtype=bool)
+        global_ext_mask[np.asarray(g_ext, dtype=int)] = True
 
     for subdomain in subdomains:
-        f_star_minus = subdomain["P"].dot(robin_rhs)
         local_to_global_dof = subdomain["local_to_global_dof"]
-        f_star_minus_local = np.asarray(f_star_minus[local_to_global_dof], dtype=float)
-        f_star_minus_local_fn = Function(subdomain["V_sub"])
-        f_star_minus_local_fn.vector()[:] = f_star_minus_local
-
-        subdomain["A3"] = A3
-        subdomain["G3"] = G3
-        subdomain["b3"] = b3
-        subdomain["u3_star"] = u3_star
-        subdomain["f_star_minus"] = f_star_minus
-        subdomain["f_star_minus_norm_l2"] = float(np.linalg.norm(f_star_minus))
-        subdomain["f_star_minus_local"] = f_star_minus_local
-        subdomain["f_star_minus_local_fn"] = f_star_minus_local_fn
-        subdomain["f_star_minus_local_norm_l2"] = float(np.linalg.norm(f_star_minus_local))
 
         # Restrict graph coupling candidates to vertices near this subdomain.
         q_coords = subdomain["meshQ"].coordinates()
@@ -662,33 +344,32 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
             gamma=1.0,
             interior_tag=222,
             f3d=0.0,
+            C_global=solver.C if restrict_global_C else None,
+            l2g=local_to_global_dof if restrict_global_C else None,
         ).build()
 
-        # Pin u=0 outside the physical domain, as the full-domain solve does.
-        n_ext, n_int = eliminate_exterior_local(partition_solver, interior_tag=222)
+        # Pin u=0 outside the physical domain, as the full-domain solve does,
+        # using the GLOBAL classification so the two agree dof-for-dof.
+        n_ext, n_int = eliminate_exterior_local(
+            partition_solver,
+            interior_tag=222,
+            global_ext_mask=global_ext_mask,
+            l2g=local_to_global_dof,
+        )
         subdomain["exterior_dofs_eliminated"] = n_ext
         subdomain["interior_dofs_kept"] = n_int
 
         partition_solver.solve()
         subdomain["partition_solver"] = partition_solver
 
-        # Add Robin flux term after solving the partition PDE.
         u_part_raw = partition_solver.u3d.vector().get_local()
-        u_part_robin = u_part_raw + f_star_minus_local
-        u3d_partition_post_robin = Function(subdomain["V_sub"])
-        u3d_partition_post_robin.vector()[:] = u_part_robin
-
         subdomain["u3d_partition_raw"] = partition_solver.u3d
-        subdomain["u3d_partition"] = u3d_partition_post_robin
-        subdomain["u3d_partition_robin_correction_norm_l2"] = float(np.linalg.norm(f_star_minus_local))
+        subdomain["u3d_partition"] = partition_solver.u3d
 
         # Local reference-vs-partition error on the subdomain mesh.
         u_full_local = subdomain["sol_3d_sub"].vector().get_local()
         local_error_raw = u_full_local - u_part_raw
-        u_part_local = u_part_robin
-        local_error = u_full_local - u_part_local
         u_full_local_norm = float(np.linalg.norm(u_full_local))
-        u_part_local_norm = float(np.linalg.norm(u_part_local))
         subdomain["u3d_partition_error_local_raw"] = local_error_raw
         subdomain["u3d_partition_error_local_raw_norm_l2"] = float(np.linalg.norm(local_error_raw))
         subdomain["u3d_partition_error_local_raw_rel_l2"] = (
@@ -696,15 +377,8 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
             if u_full_local_norm > 1e-12
             else 0.0
         )
-        subdomain["u3d_partition_error_local"] = local_error
-        subdomain["u3d_partition_error_local_norm_l2"] = float(np.linalg.norm(local_error))
         subdomain["u3d_full_local_norm_l2"] = u_full_local_norm
-        subdomain["u3d_partition_local_norm_l2"] = u_part_local_norm
-        subdomain["u3d_partition_error_local_rel_l2"] = (
-            subdomain["u3d_partition_error_local_norm_l2"] / u_full_local_norm
-            if u_full_local_norm > 1e-12
-            else 0.0
-        )
+        subdomain["u3d_partition_local_norm_l2"] = float(np.linalg.norm(u_part_raw))
         subdomain["partition_rhs_norm_l2"] = float(np.linalg.norm(partition_solver.rhs))
         subdomain["partition_rhs_b0_norm_l2"] = float(np.linalg.norm(partition_solver.rhs_b0))
         subdomain["partition_rhs_coupling_norm_l2"] = float(
@@ -723,19 +397,14 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
         u_partition_sum_raw[local_to_global_dof] += u_part_raw
         u_partition_count_raw[local_to_global_dof] += 1.0
 
-        # Contribute partition solution to a reconstructed full-domain field.
-        u_partition_sum[local_to_global_dof] += u_part_local
-        u_partition_count[local_to_global_dof] += 1.0
-
     covered_raw = u_partition_count_raw > 0.0
     u3d_reconstructed_raw_vec = np.zeros(n_global, dtype=float)
     u3d_reconstructed_raw_vec[covered_raw] = (
         u_partition_sum_raw[covered_raw] / u_partition_count_raw[covered_raw]
     )
 
-    covered = u_partition_count > 0.0
-    u3d_reconstructed_vec = np.zeros(n_global, dtype=float)
-    u3d_reconstructed_vec[covered] = u_partition_sum[covered] / u_partition_count[covered]
+    covered = covered_raw
+    u3d_reconstructed_vec = u3d_reconstructed_raw_vec
 
     # If a global dof is uncovered (should not happen with full tiling), keep
     # the full-domain reference value to avoid introducing artificial error.
@@ -760,8 +429,10 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
     full_error_rel_l2 = full_error_l2 / full_ref_l2 if full_ref_l2 > 0.0 else 0.0
     covered_count = int(np.count_nonzero(covered))
     uncovered_count = int(n_global - covered_count)
-    overlap_count = int(np.count_nonzero(u_partition_count > 1.0))
-    max_overlap = int(u_partition_count.max()) if len(u_partition_count) else 0
+    overlap_count = int(np.count_nonzero(u_partition_count_raw > 1.0))
+    max_overlap = (
+        int(u_partition_count_raw.max()) if len(u_partition_count_raw) else 0
+    )
 
     for subdomain in subdomains:
         subdomain["u3d_reconstructed_full_raw"] = u3d_reconstructed_raw
@@ -779,19 +450,11 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
     if print_summary and subdomains:
         n_subdomains = len(subdomains)
         cell_counts = np.array([sd["cell_counts"] for sd in subdomains], dtype=int)
-        p_nnz = np.array([sd["P"].nnz for sd in subdomains], dtype=int)
-        f_norms = np.array([sd["f_star_minus_norm_l2"] for sd in subdomains], dtype=float)
         local_err_norms_raw = np.array(
             [sd["u3d_partition_error_local_raw_norm_l2"] for sd in subdomains], dtype=float
         )
-        local_err_norms = np.array(
-            [sd["u3d_partition_error_local_norm_l2"] for sd in subdomains], dtype=float
-        )
         local_err_rel_raw = np.array(
             [sd["u3d_partition_error_local_raw_rel_l2"] for sd in subdomains], dtype=float
-        )
-        local_err_rel = np.array(
-            [sd["u3d_partition_error_local_rel_l2"] for sd in subdomains], dtype=float
         )
         rhs_norms = np.array([sd["partition_rhs_norm_l2"] for sd in subdomains], dtype=float)
         rhs_b0_norms = np.array([sd["partition_rhs_b0_norm_l2"] for sd in subdomains], dtype=float)
@@ -807,18 +470,15 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
         zero_active_count = int(np.count_nonzero(active_q_counts == 0))
         print("Decomposition summary:")
         print(f"  subdomains: {n_subdomains}")
+        p_nnz = np.array([sd["P"].nnz for sd in subdomains], dtype=int)
+        print(
+            "  P^Gamma nnz (= selected interface dofs, artificial cuts only): "
+            f"min={p_nnz.min()} max={p_nnz.max()}"
+        )
         print(
             "  cell_counts per axis: "
             f"min=({cell_counts[:, 0].min()}, {cell_counts[:, 1].min()}, {cell_counts[:, 2].min()}) "
             f"max=({cell_counts[:, 0].max()}, {cell_counts[:, 1].max()}, {cell_counts[:, 2].max()})"
-        )
-        print(
-            "  P.nnz: "
-            f"min={p_nnz.min()} max={p_nnz.max()} avg={float(p_nnz.mean()):.1f}"
-        )
-        print(
-            "  ||f_star_minus||_2: "
-            f"min={f_norms.min():.3e} max={f_norms.max():.3e} avg={f_norms.mean():.3e}"
         )
         print(
             "  ||u_full_sub - u_partition_sub_raw||_2: "
@@ -827,22 +487,10 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
             f"avg={local_err_norms_raw.mean():.3e}"
         )
         print(
-            "  ||u_full_sub - u_partition_sub_post_robin||_2: "
-            f"min={local_err_norms.min():.3e} "
-            f"max={local_err_norms.max():.3e} "
-            f"avg={local_err_norms.mean():.3e}"
-        )
-        print(
             "  relative ||u_full_sub - u_partition_sub_raw||_2 / ||u_full_sub||_2: "
             f"min={local_err_rel_raw.min():.3e} "
             f"max={local_err_rel_raw.max():.3e} "
             f"avg={local_err_rel_raw.mean():.3e}"
-        )
-        print(
-            "  relative ||u_full_sub - u_partition_sub_post_robin||_2 / ||u_full_sub||_2: "
-            f"min={local_err_rel.min():.3e} "
-            f"max={local_err_rel.max():.3e} "
-            f"avg={local_err_rel.mean():.3e}"
         )
         print(
             "  partition rhs norm ||rhs||_2: "
@@ -882,10 +530,6 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
             f"abs={full_error_raw_l2:.3e} rel={full_error_raw_rel_l2:.3e}"
         )
         print(
-            "  ||u_full - u_reconstructed_post_robin_partitions||_2: "
-            f"abs={full_error_l2:.3e} rel={full_error_rel_l2:.3e}"
-        )
-        print(
             "  reconstructed full-domain coverage: "
             f"covered={covered_count}/{n_global} "
             f"uncovered={uncovered_count} "
@@ -894,14 +538,14 @@ def solve_partition_domain(subdomains, solver, rho_robin=1.0, print_summary=True
         )
 
         top_k = min(5, n_subdomains)
-        worst_ids = np.argsort(-local_err_rel)[:top_k]
-        print("  worst subdomains by relative local error:")
+        worst_ids = np.argsort(-local_err_rel_raw)[:top_k]
+        print("  worst subdomains by relative local error (raw):")
         for wid in worst_ids:
             sd = subdomains[int(wid)]
             print(
                 f"    {sd['ijk']}: "
-                f"abs_err={sd['u3d_partition_error_local_norm_l2']:.3e} "
-                f"rel_err={sd['u3d_partition_error_local_rel_l2']:.3e} "
+                f"abs_err={sd['u3d_partition_error_local_raw_norm_l2']:.3e} "
+                f"rel_err={sd['u3d_partition_error_local_raw_rel_l2']:.3e} "
                 f"||rhs||={sd['partition_rhs_norm_l2']:.3e} "
                 f"||b0||={sd['partition_rhs_b0_norm_l2']:.3e} "
                 f"||cpl||={sd['partition_rhs_coupling_norm_l2']:.3e} "
@@ -918,8 +562,18 @@ def decomposeDomain(
     x_ROM_lenght=5.0,
     y_ROM_lenght=5.0,
     z_ROM_lenght=5.0,
-    rho_robin=1.0,
+    restrict_global_C=False,
 ):
+    """Build the subdomains and solve each one in isolation.
+
+    This module ends where the local solve ends. The returned subdomains carry
+    everything a transmission scheme needs -- partition_solver,
+    local_to_global_dof, P, ijk, sol_3d_sub and the raw per-box errors -- and
+    the schemes themselves live elsewhere:
+
+        Robin_residual.apply_robin_residual  -- eqs. (4)-(5), one-shot
+        Solve_schwarz_robin.solve_schwarz_robin -- iterative trace exchange
+    """
     V, Q = solver.W
     meshV = V.mesh()
     meshQ = Q.mesh()
@@ -1120,91 +774,77 @@ def decomposeDomain(
         z_start = int(subdomain["z_start"])
         z_stop = int(subdomain["z_stop"])
 
+        # P^Gamma is a RESTRICTION: it keeps the rows of the global residual
+        # that sit on this box's ARTIFICIAL cut planes and discards every other
+        # row. It is a projector -- 1 on the diagonal for selected dofs, zero
+        # everywhere else -- so (P r)[d] = r[d] on the interface and 0 off it.
+        #
+        # It must NOT be a neighbour stencil: summing r over a 27-point cube
+        # multiplies the extracted flux by ~27 and makes the local solves blow
+        # up. Coupling between neighbouring interface nodes is the job of the
+        # interface mass matrix G^Gamma, not of the restriction.
+        #
+        # Faces lying on the true outer boundary are excluded: they are not
+        # interfaces between subdomains and carry no transmission data.
+        x_lo_cut = x_start > 0
+        x_hi_cut = x_stop < len(unique_x) - 1
+        y_lo_cut = y_start > 0
+        y_hi_cut = y_stop < len(unique_y) - 1
+        z_lo_cut = z_start > 0
+        z_hi_cut = z_stop < len(unique_z) - 1
+
         border_triplets = set()
 
         # z-faces
         for ix in range(x_start, x_stop + 1):
             for iy in range(y_start, y_stop + 1):
-                border_triplets.add((ix, iy, z_start))
-                border_triplets.add((ix, iy, z_stop))
+                if z_lo_cut:
+                    border_triplets.add((ix, iy, z_start))
+                if z_hi_cut:
+                    border_triplets.add((ix, iy, z_stop))
 
         # x-faces
         for iy in range(y_start, y_stop + 1):
             for iz in range(z_start, z_stop + 1):
-                border_triplets.add((x_start, iy, iz))
-                border_triplets.add((x_stop, iy, iz))
+                if x_lo_cut:
+                    border_triplets.add((x_start, iy, iz))
+                if x_hi_cut:
+                    border_triplets.add((x_stop, iy, iz))
 
         # y-faces
         for ix in range(x_start, x_stop + 1):
             for iz in range(z_start, z_stop + 1):
-                border_triplets.add((ix, y_start, iz))
-                border_triplets.add((ix, y_stop, iz))
+                if y_lo_cut:
+                    border_triplets.add((ix, y_start, iz))
+                if y_hi_cut:
+                    border_triplets.add((ix, y_stop, iz))
 
         p_rows = []
         p_cols = []
         p_data = []
 
-        # Build P from structured border indices directly.
         for ix, iy, iz in border_triplets:
             assert (ix, iy, iz) in mesh_triplets, (
                 f"Border index ({ix}, {iy}, {iz}) is missing from the original mesh."
             )
-
-            for di in range(-1, 2):
-                for dj in range(-1, 2):
-                    for dk in range(-1, 2):
-                        nix = ix + di
-                        niy = iy + dj
-                        niz = iz + dk
-                        if (
-                            0 <= nix < len(unique_x)
-                            and 0 <= niy < len(unique_y)
-                            and 0 <= niz < len(unique_z)
-                        ):
-                            assert (nix, niy, niz) in mesh_triplets, (
-                                f"Neighbor index ({nix}, {niy}, {niz}) is missing "
-                                "from the original mesh."
-                            )
-
-                            row_key = (ix, iy, iz)
-                            col_key = (nix, niy, niz)
-                            if row_key in triplet_to_global_dof and col_key in triplet_to_global_dof:
-                                p_rows.append(triplet_to_global_dof[row_key])
-                                p_cols.append(triplet_to_global_dof[col_key])
-                                p_data.append(1.0)
+            key = (ix, iy, iz)
+            if key in triplet_to_global_dof:
+                d = triplet_to_global_dof[key]
+                p_rows.append(d)
+                p_cols.append(d)
+                p_data.append(1.0)
 
         P = csr_matrix(
             (p_data, (p_rows, p_cols)),
             shape=(V.dim(), V.dim()),
         )
-        if P.nnz:
-            P.data[:] = 1.0
         subdomain["P"] = P
+        subdomain["n_interface_dofs"] = int(len(p_rows))
 
-    subdomains = solve_partition_domain(
-        subdomains, solver, rho_robin=rho_robin, print_summary=True
+    return solve_partition_domain(
+        subdomains, solver, print_summary=True,
+        restrict_global_C=restrict_global_C,
     )
-    diagnose_exact_dirichlet(subdomains, solver, print_summary=True)
-
-    # rho sweep: diagnose whether the Robin fixed point is consistent.
-    # A trace-only condition converges to a rho-insensitive wrong limit; large
-    # rho should degenerate toward Dirichlet and approach the diagnostic floor.
-    hmax = solver.meshV.hmax()
-    rho_base = float(solver.sigma3d) / max(float(hmax), 1e-30)
-    print("")
-    print("rho sweep (converged error vs Robin penalty):")
-    print("  rho          | iters | avg rel local | rel global")
-    for mult in (0.1, 1.0, 10.0, 100.0, 1000.0):
-        rho = rho_base * mult
-        hist = solve_schwarz_robin(
-            subdomains, solver, rho_robin=rho, max_iter=60, tol=1e-8,
-            print_summary=False,
-        )
-        it, delta, rl, rg = hist[-1]
-        print(f"  {rho:.4e} | {it:5d} | {rl:.6e}  | {rg:.6e}")
-
-    solve_schwarz_robin(subdomains, solver, print_summary=True)
-    return subdomains
 
 
 
