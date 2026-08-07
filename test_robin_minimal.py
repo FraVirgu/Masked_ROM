@@ -54,6 +54,8 @@ Run:
 """
 
 import argparse
+import os
+import tempfile
 
 import numpy as np
 from scipy.sparse.linalg import spsolve, splu
@@ -64,13 +66,16 @@ from dolfin import (
     Mesh,
     MeshEditor,
     MeshFunction,
+    XDMFFile,
 )
 
 from Solver_partition_domain import SolverPartitionDomain
+from Solver_full_domain import Solver3D1D
 from Decompose_Domain_Analytic import matrix_to_csr
 from Robin_residual import _robin_interface
 
 INTERIOR_TAG = 222
+INLET_TAG = 111
 
 
 # =============================================================================
@@ -92,24 +97,110 @@ def build_line_mesh(points):
     return mesh
 
 
-def vessel_points(where):
-    """Two nodes spanning the box in y, at the x the caller asks for.
+def vessel_points(where, axis):
+    """Two nodes spanning the box in y, displaced along the cut axis.
 
-    The segment runs along y, so its averaging circle lies in the x-z plane and
-    its extent in x is +/- the radius about the segment's x.
+    The segment always runs along y, so its averaging circle lies in the x-z
+    plane. The cut axis therefore falls into two qualitatively different cases:
 
-    'offset' x=0.25  -- circle entirely inside box 0, clear of the cut.
-    'near'   x=0.46  -- circle straddles the cut (0.46 + 0.08 > 0.5) but no
-                        quadrature point lands exactly on it. This is the clean
-                        test of a straddling vessel.
-    'middle' x=0.5   -- segment exactly ON the cut. Degenerate: quadrature
-                        points sitting exactly on the plane are accepted or
-                        rejected by a cell-collision tie-break that differs
-                        between the two boxes, so the two halves disagree even
-                        though the configuration is mirror-symmetric.
+    axis 0 (x) or 2 (z) -- the cut plane is PARALLEL to the vessel axis and
+        slices through the averaging circle. The vessel's extent along the cut
+        axis is +/- the radius about its offset, so the circle straddles
+        whenever offset + radius > 0.5. This is the case the whole test is
+        about, and x and z are related by a 90-degree rotation about y: they
+        must give identical numbers.
+
+    axis 1 (y) -- the cut plane is PERPENDICULAR to the vessel axis and slices
+        the SEGMENT, not the circle. Every averaging circle lies wholly in one
+        box (its plane is parallel to the cut), so nothing ever straddles no
+        matter where 'where' puts it. The vessel is genuinely cut -- one node
+        each side, the 1D mass matrix G couples across -- but eq. (4)'s Key
+        point is not threatened. This is the control.
+
+    'offset' 0.25  -- circle entirely inside box 0, clear of the cut.
+    'near'   0.46  -- circle straddles the cut (0.46 + 0.08 > 0.5) but no
+                      quadrature point lands exactly on it. The clean test.
+    'middle' 0.5   -- segment exactly ON the cut. Degenerate: quadrature points
+                      sitting exactly on the plane are accepted or rejected by
+                      a cell-collision tie-break that differs between the two
+                      boxes, so the two halves disagree even though the
+                      configuration is mirror-symmetric.
     """
-    x = {"middle": 0.5, "near": 0.46, "offset": 0.25}[where]
-    return [(x, 0.25, 0.5), (x, 0.75, 0.5)]
+    off = {"middle": 0.5, "near": 0.46, "offset": 0.25}[where]
+
+    if axis == 1:
+        # Cutting across the vessel: 'where' would move the segment's ENDS, not
+        # its distance from the plane, which is not the same knob at all. Keep
+        # the segment centred and spanning the cut so the plane always crosses
+        # it; the circles stay parallel to the plane whatever we do.
+        return [(0.5, 0.25, 0.5), (0.5, 0.75, 0.5)]
+
+    # Cut parallel to the vessel: displace along the cut axis.
+    p0 = [0.5, 0.25, 0.5]
+    p1 = [0.5, 0.75, 0.5]
+    p0[axis] = p1[axis] = off
+    return [tuple(p0), tuple(p1)]
+
+
+def solve_coupled_global(meshV, pts, radius, sigma3d, sigma1d, kappa):
+    """The coupled 3D-1D solve on the whole box: returns (u_star, p_sol).
+
+    This is what the real pipeline does (see Robin_residual.py's __main__):
+    Solver3D1D solves the MONOLITHIC system for [3D block | 1D block], so the
+    1D pressure is an UNKNOWN, determined by the coupling. Only afterwards is
+    that solved field handed to SolverPartitionDomain as known data.
+
+    Prescribing p_known by hand instead -- as an earlier version of this test
+    did -- makes u_star and p_known mutually inconsistent: u_star is then the
+    3D response to an arbitrary 1D field rather than to the field the coupled
+    problem actually produces. On a cut normal to the vessel that matters a
+    great deal, because a hand-picked datum like [1,0] imposes an asymmetry on
+    a geometrically symmetric configuration and the measured interface support
+    inherits it.
+
+    Solver3D1D reads its 1D mesh from XDMF, so the segment is written out and
+    reloaded rather than passing the in-memory mesh. The 3D mesh and markers
+    are injected directly, which is what lets us skip the sphere boundary.
+    """
+    tmp = tempfile.mkdtemp(prefix="robin_min_")
+    prefix = os.path.join(tmp, "seg_")
+
+    meshQ = build_line_mesh(pts)
+
+    with XDMFFile(f"{prefix}marked_mesh.xdmf") as f:
+        f.write(meshQ)
+
+    # Vertex 0 is the inlet: that is where the Nitsche term drives p_in. The
+    # far node is left untagged and picks up the natural condition.
+    markers = MeshFunction("size_t", meshQ, 0, 0)
+    markers[0] = INLET_TAG
+    with XDMFFile(f"{prefix}markers.xdmf") as f:
+        f.write(markers)
+
+    radii = MeshFunction("double", meshQ, 0)
+    radii.array()[:] = radius
+    with XDMFFile(f"{prefix}radii.xdmf") as f:
+        f.write(radii)
+
+    cell_markers = MeshFunction("size_t", meshV, 3, INTERIOR_TAG)
+
+    solver = Solver3D1D(
+        path_to_1D_mesh=prefix,
+        boundary=None,
+        n=meshV.num_cells(),          # unused: full_domain_mesh wins
+        sigma3d=sigma3d,
+        sigma1d=sigma1d,
+        kappa=kappa,
+        exterior="dirichlet",
+        full_domain_mesh=meshV,
+        full_domain_markers=cell_markers,
+        inlet_tag=INLET_TAG,
+    ).build()
+    solver.solve()
+
+    return (solver.u3d.vector().get_local(),
+            solver.u1d.vector().get_local(),
+            solver)
 
 
 def make_subdomain(mesh_lo, mesh_hi, n_sub, meshQ, q_radii, p_known,
@@ -199,14 +290,23 @@ def main():
     )
     ap.add_argument("-n", type=int, default=12,
                     help="cells per axis on the GLOBAL box (must be even so "
-                         "the cut at x=0.5 lands on a grid plane)")
+                         "the cut at 0.5 lands on a grid plane)")
+    ap.add_argument("-axis", choices=("x", "y", "z"), default="x",
+                    help="which axis the cut plane is normal to. The vessel "
+                         "runs along y, so 'x' and 'z' cut THROUGH the "
+                         "averaging circle (equivalent by symmetry) while 'y' "
+                         "cuts across the segment and never straddles.")
     ap.add_argument("-vessel", choices=("middle", "near", "offset"),
                     default="near",
-                    help="where the vessel sits relative to the cut at x=0.5: "
+                    help="where the vessel sits relative to the cut at 0.5: "
                          "'offset' clear of it, 'near' straddling it cleanly, "
-                         "'middle' exactly on it (degenerate)")
+                         "'middle' exactly on it (degenerate). Ignored for "
+                         "-axis y, where the segment always spans the cut.")
     ap.add_argument("-radius", type=float, default=0.08,
                     help="vessel radius (the averaging circle's radius)")
+    ap.add_argument("-sigma1d", type=float, default=1.0,
+                    help="1D conductivity for the coupled global solve that "
+                         "produces p_sol")
     ap.add_argument("-sigma3d", type=float, default=1e-3)
     ap.add_argument("-kappa", type=float, default=1.0)
     ap.add_argument("-rho", type=float, default=None,
@@ -230,35 +330,61 @@ def main():
     args = ap.parse_args()
 
     if args.n % 2:
-        raise SystemExit(f"-n must be even so x=0.5 is a grid plane, got {args.n}")
+        raise SystemExit(f"-n must be even so 0.5 is a grid plane, got {args.n}")
 
+    ax = {"x": 0, "y": 1, "z": 2}[args.axis]
+    an = args.axis
     lo, hi = (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
     half = args.n // 2
 
     print("=" * 68)
-    print(f"minimal Robin-residual test: [0,1]^3, 2 boxes, vessel '{args.vessel}'")
+    print(f"minimal Robin-residual test: [0,1]^3, 2 boxes, cut {an}=0.5, "
+          f"vessel '{args.vessel}'")
     print("=" * 68)
 
     # ---- 1D vessel ---------------------------------------------------------
-    pts = vessel_points(args.vessel)
+    pts = vessel_points(args.vessel, ax)
     meshQ = build_line_mesh(pts)
     q_radii = np.full(meshQ.num_vertices(), args.radius, dtype=float)
-    # A known linear pressure drop along the vessel; any nonzero datum works,
-    # the scheme never sees where it came from.
-    p_known = np.array([1.0, 0.0], dtype=float)
     print(f"  vessel: {pts[0]} -> {pts[1]}  radius={args.radius}")
-    reach = pts[0][0] + args.radius
-    if args.vessel == "offset":
-        where = f"is clear of it (reaches x={reach:.3f})"
-    elif args.vessel == "near":
-        where = f"STRADDLES it (reaches x={reach:.3f} > 0.5)"
+    if ax == 1:
+        # The cut is normal to the vessel axis, so it slices the segment. The
+        # circles are parallel to the plane and each lies wholly on one side.
+        print(f"  cut plane at {an}=0.5; it cuts the SEGMENT "
+              f"({pts[0][1]:.2f} -> {pts[1][1]:.2f} spans it), but every "
+              f"averaging circle\n  is parallel to the plane, so none straddle")
     else:
-        where = "sits exactly ON it (degenerate)"
-    print(f"  cut plane at x=0.5; vessel circle {where}")
+        reach = pts[0][ax] + args.radius
+        if args.vessel == "offset":
+            where = f"is clear of it (reaches {an}={reach:.3f})"
+        elif args.vessel == "near":
+            where = f"STRADDLES it (reaches {an}={reach:.3f} > 0.5)"
+        else:
+            where = "sits exactly ON it (degenerate)"
+        print(f"  cut plane at {an}=0.5; vessel circle {where}")
 
     # ---- global problem ----------------------------------------------------
+    # Two solves, in the order the real pipeline uses them:
+    #
+    #   1. the COUPLED 3D-1D solve, in which the 1D pressure is an unknown.
+    #      This is the only place p_sol can come from; prescribing it by hand
+    #      would make it inconsistent with u_star.
+    #   2. the SolverPartitionDomain solve on the whole box, with p_sol now
+    #      treated as known data. This is the operator the subdomain solves
+    #      are restrictions of, so the residual test must compare against it.
+    #
+    # Step 2 reproduces step 1's 3D field when the coupling is consistent, and
+    # the agreement between them is printed as a sanity check: a large gap
+    # means the two solvers disagree about the same physics and nothing
+    # downstream is trustworthy.
     meshV = BoxMesh(Point(*lo), Point(*hi), args.n, args.n, args.n)
     markers = MeshFunction("size_t", meshV, 3, INTERIOR_TAG)
+
+    u_coupled, p_sol, coupled = solve_coupled_global(
+        meshV, pts, args.radius, args.sigma3d, args.sigma1d, args.kappa)
+    p_known = p_sol
+    print(f"  coupled solve: p_sol = {np.array2string(p_sol, precision=4)}")
+
     glob = SolverPartitionDomain(
         meshV=meshV, meshV_markers=markers, meshQ=meshQ,
         q_radii=q_radii, p_known=p_known,
@@ -272,7 +398,10 @@ def main():
     n_global = V_global.dim()
     coords_global = V_global.tabulate_dof_coordinates().reshape((n_global, -1))
     u_star = glob.u3d.vector().get_local()
+    d_cpl = (np.linalg.norm(u_star - u_coupled)
+             / max(np.linalg.norm(u_coupled), 1e-30))
     print(f"  global: {n_global} dofs, ||u*||={np.linalg.norm(u_star):.4e}")
+    print(f"  coupled vs p_known-driven 3D field: rel diff {d_cpl:.3e}")
 
     # ---- two subdomains, split at x = 0.5 ----------------------------------
     # -cross needs the global arc weights preserved, so it implies -restrict_C.
@@ -282,16 +411,26 @@ def main():
     restrict_C = args.restrict_C or args.cross
     C_for_boxes = glob.C if restrict_C else None
 
-    subdomains = [
-        make_subdomain((0.0, 0.0, 0.0), (0.5, 1.0, 1.0),
-                       (half, args.n, args.n), meshQ, q_radii, p_known,
-                       args.sigma3d, args.kappa, (0, 0, 0),
-                       V_global, coords_global, C_global=C_for_boxes),
-        make_subdomain((0.5, 0.0, 0.0), (1.0, 1.0, 1.0),
-                       (half, args.n, args.n), meshQ, q_radii, p_known,
-                       args.sigma3d, args.kappa, (1, 0, 0),
-                       V_global, coords_global, C_global=C_for_boxes),
-    ]
+    # Split the unit box in two along the chosen axis: the low box gets
+    # [0,0.5] on that axis, the high box [0.5,1], both full-width on the other
+    # two. ijk differs by 1 along the cut axis only, so the boxes are face
+    # neighbours whichever axis is chosen.
+    def _box(side):
+        b_lo, b_hi = list(lo), list(hi)
+        n_sub = [args.n, args.n, args.n]
+        if side == 0:
+            b_hi[ax] = 0.5
+        else:
+            b_lo[ax] = 0.5
+        n_sub[ax] = half
+        ijk = [0, 0, 0]
+        ijk[ax] = side
+        return make_subdomain(tuple(b_lo), tuple(b_hi), tuple(n_sub),
+                              meshQ, q_radii, p_known, args.sigma3d,
+                              args.kappa, tuple(ijk), V_global, coords_global,
+                              C_global=C_for_boxes)
+
+    subdomains = [_box(0), _box(1)]
 
     # ---- operator correctness ----------------------------------------------
     # Everything downstream assumes A_i is the one-sided restriction of the
@@ -383,9 +522,10 @@ def main():
         G_gamma, n_tagged = _robin_interface(ps, g_min, g_max)
         sd["_G_gamma"] = G_gamma
 
-        # Interface = dofs on the cut plane. With one cut this is just x=0.5.
+        # Interface = dofs on the cut plane. With one cut this is just the
+        # chosen axis at 0.5.
         sub_coords = ps.V.tabulate_dof_coordinates().reshape((ps.V.dim(), -1))
-        on_if = np.abs(sub_coords[:, 0] - 0.5) < 1e-10
+        on_if = np.abs(sub_coords[:, ax] - 0.5) < 1e-10
         sd["_sel"] = on_if
 
         # ---- the missing 1D-network term --------------------------------
@@ -430,12 +570,33 @@ def main():
             far_avg = glob.C.dot(u_star) - Ci.dot(u_i)
             cross = Ci.T.dot(glob.G.dot(far_avg))
 
-            # Straddling nodes: this box holds part of the circle but not all
-            # of the global row's weight.
+            # TWO independent ways the cross term can be nonzero. The x/z cut
+            # exercises only the first, the y cut only the second, and an
+            # earlier guard here assumed the first was the whole story.
+            #
+            # (a) circle straddling: this box holds part of a node's averaging
+            #     circle but not all of the global row's weight. Geometry of
+            #     the CIRCLE vs the plane.
             w_i = np.asarray(np.abs(Ci).sum(axis=1)).ravel()
             w_g = np.asarray(np.abs(glob.C.tocsr()).sum(axis=1)).ravel()
+            owns = w_i > 1e-14
             sd["_n_straddle"] = int(np.count_nonzero(
-                (w_i > 1e-14) & (w_g - w_i > 1e-14 * np.maximum(w_g, 1.0))))
+                owns & (w_g - w_i > 1e-14 * np.maximum(w_g, 1.0))))
+
+            # (b) network coupling: G is a CG1 mass matrix on the 1D mesh, so
+            #     it has off-diagonal entries between neighbouring vessel
+            #     nodes. If the cut separates two coupled nodes, this box's
+            #     rows carry G_vw * (far average at w) even though every
+            #     circle it touches is whole. Geometry of the SEGMENT vs the
+            #     plane -- entirely independent of (a).
+            Gg = glob.G.tocsr()
+            n_link = 0
+            for v in np.flatnonzero(owns):
+                s, e = Gg.indptr[v], Gg.indptr[v + 1]
+                for w, gvw in zip(Gg.indices[s:e], Gg.data[s:e]):
+                    if w != v and abs(gvw) > 1e-14 and not owns[w]:
+                        n_link += 1
+            sd["_n_link"] = n_link
             sd["_far_norm"] = float(np.linalg.norm(far_avg))
 
         sd["_cross"] = cross
@@ -456,12 +617,16 @@ def main():
         extra = ""
         if args.cross:
             n_str = sd.get("_n_straddle", 0)
-            extra = (f", {n_str} straddling nodes "
+            n_lnk = sd.get("_n_link", 0)
+            extra = (f", {n_str} straddling nodes, {n_lnk} cut network links "
                      f"(||cross||={np.linalg.norm(cross):.3e})")
-            # Regression guard: with nothing straddling, the cross term must
-            # vanish identically and the scheme must reduce to plain eq. (4).
-            if n_str == 0 and np.linalg.norm(cross) > 1e-12:
-                extra += "  <-- BUG: no straddling nodes but cross != 0"
+            # Regression guard: the cross term must vanish only when BOTH
+            # mechanisms are absent -- no split circle AND no 1D link across
+            # the cut. Checking straddling alone falsely flags the y cut,
+            # where whole circles sit either side of a cut segment and the
+            # off-diagonal of G legitimately carries the coupling.
+            if n_str == 0 and n_lnk == 0 and np.linalg.norm(cross) > 1e-12:
+                extra += "  <-- BUG: nothing crosses the cut but cross != 0"
         print(f"    {sd['ijk']}: {int(on_if.sum())} interface dofs, "
               f"{n_tagged} tagged facets{extra}")
         print(f"        ||r||={n_all:.4e}  interface={n_if:.4e} "
@@ -469,16 +634,25 @@ def main():
         print(f"        flux term alone: {f_if / max(f_all, 1e-30):6.1%} "
               f"on interface")
 
-    # Only 'middle' is mirror-symmetric about the cut, so only there must the
-    # two boxes agree. 'near' puts the vessel axis inside box 0, which is a
-    # genuinely asymmetric configuration -- an earlier version flagged it too
-    # and that warning was meaningless.
-    if args.vessel == "middle":
-        f0, f1 = subdomains[0]["_frac"], subdomains[1]["_frac"]
-        if abs(f0 - f1) > 0.05 * max(f0, f1, 1e-30):
-            print(f"    NOTE: the two boxes disagree ({f0:.1%} vs {f1:.1%}) on "
-                  f"a mirror-symmetric configuration.\n"
-                  f"          Quadrature points sitting exactly on the cut are "
+    # For a cut PARALLEL to the vessel only 'middle' is mirror-symmetric about
+    # the plane, so only there must the two boxes agree. 'near' puts the vessel
+    # axis inside box 0, which is a genuinely asymmetric configuration -- an
+    # earlier version flagged it too and that warning was meaningless.
+    #
+    # For a cut ACROSS the vessel the segment is centred on the plane whatever
+    # -vessel says, so the configuration is always mirror-symmetric and the two
+    # boxes must always agree. Only p_known breaks the symmetry, and it does so
+    # antisymmetrically (1 -> 0), which leaves the residual NORMS equal.
+    f0, f1 = subdomains[0]["_frac"], subdomains[1]["_frac"]
+    symmetric = (ax == 1) or (args.vessel == "middle")
+    if symmetric and abs(f0 - f1) > 0.05 * max(f0, f1, 1e-30):
+        print(f"    NOTE: the two boxes disagree ({f0:.1%} vs {f1:.1%}) on "
+              f"a mirror-symmetric configuration.")
+        if ax == 1:
+            print("          A cut across the vessel should split it evenly; "
+                  "this asymmetry is not\n          explained by the geometry.")
+        else:
+            print(f"          Quadrature points sitting exactly on the cut are "
                   f"accepted by one box\n          and rejected by the other. "
                   f"Use -vessel near for a clean straddle.")
 
@@ -589,8 +763,13 @@ def main():
     # ---- side by side ------------------------------------------------------
     print("")
     print("=" * 68)
-    print(f"  vessel '{args.vessel}':  "
-          f"{'circle straddles the cut' if args.vessel != 'offset' else 'circle clear of the cut'}")
+    if ax == 1:
+        verdict = "cut across the vessel, no circle straddles"
+    elif args.vessel == "offset":
+        verdict = "circle clear of the cut"
+    else:
+        verdict = "circle straddles the cut"
+    print(f"  cut {an}=0.5, vessel '{args.vessel}':  {verdict}")
     print("")
     print(f"    {'':22s} {'avg rel local error':>20s}")
     print(f"    {'raw (no coupling)':22s} {raw_avg:20.6e}")
