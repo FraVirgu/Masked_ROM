@@ -865,7 +865,7 @@ if __name__ == "__main__":
                         help="number of inflow vessels (n_vasi)")
     parser.add_argument("-outlet", type=int, default=10,
                         help="ramifications per vessel (n_ramifications)")
-    parser.add_argument("-n",      type=int, default=50,
+    parser.add_argument("-n",      type=int, default=40,
                         help="3D background mesh resolution")
     parser.add_argument("-sigma1d", type=float, default=1.0,
                         help="1D conductivity (sigma1d)")

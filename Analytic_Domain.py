@@ -26,9 +26,9 @@ class Domain:
         n_points_per_layer: int | list[int] = 1690,
         num_points_in: int = 560,
         num_points_out: int = 560,
-        radius_mean: float = 0.01,
-        radius_std: float = 0.003,
-        radius_min: float = 0.003,
+        radius_mean: float = 0.001,
+        radius_std: float = 0.001,
+        radius_min: float = 0.001,
         radius_max: float = 0.05,
         boundary: Boundary | None = None
     ):

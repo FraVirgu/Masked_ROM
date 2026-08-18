@@ -72,7 +72,12 @@ from dolfin import (
 from Solver_partition_domain import SolverPartitionDomain
 from Solver_full_domain import Solver3D1D
 from Decompose_Domain_Analytic import matrix_to_csr
-from Robin_residual import _robin_interface
+from Robin_residual import (
+    _robin_interface,
+    build_cross_term,
+    build_local_operator,
+    count_straddling_nodes,
+)
 
 INTERIOR_TAG = 222
 INLET_TAG = 111
@@ -302,7 +307,7 @@ def main():
                          "'offset' clear of it, 'near' straddling it cleanly, "
                          "'middle' exactly on it (degenerate). Ignored for "
                          "-axis y, where the segment always spans the cut.")
-    ap.add_argument("-radius", type=float, default=0.08,
+    ap.add_argument("-radius", type=float, default=0.001,
                     help="vessel radius (the averaging circle's radius)")
     ap.add_argument("-sigma1d", type=float, default=1.0,
                     help="1D conductivity for the coupled global solve that "
@@ -354,13 +359,18 @@ def main():
               f"({pts[0][1]:.2f} -> {pts[1][1]:.2f} spans it), but every "
               f"averaging circle\n  is parallel to the plane, so none straddle")
     else:
+        # Whether the circle actually straddles is a fact about the radius, not
+        # about the -vessel label: at small -radius even 'near' is clear of the
+        # cut. Compute it rather than assuming it from the label.
         reach = pts[0][ax] + args.radius
-        if args.vessel == "offset":
-            where = f"is clear of it (reaches {an}={reach:.3f})"
-        elif args.vessel == "near":
+        if abs(pts[0][ax] - 0.5) < 1e-12:
+            where = "sits exactly ON it (degenerate)"
+        elif reach > 0.5:
             where = f"STRADDLES it (reaches {an}={reach:.3f} > 0.5)"
         else:
-            where = "sits exactly ON it (degenerate)"
+            note = ("; -vessel near but radius too small to straddle"
+                    if args.vessel == "near" else "")
+            where = f"is clear of it (reaches {an}={reach:.3f} < 0.5{note})"
         print(f"  cut plane at {an}=0.5; vessel circle {where}")
 
     # ---- global problem ----------------------------------------------------
@@ -486,6 +496,51 @@ def main():
             print("        -> COUPLING block differs from the global operator;"
                   " eq. (4)'s Key point cannot hold")
 
+        # ---- the rows the interior test SKIPS ---------------------------
+        # The loop above discards every row whose global stencil leaves the
+        # box, and those are exactly the rows where A_i can differ from the
+        # global operator. Reporting only the interior rows therefore proves
+        # the operator correct on the part of the domain where nothing was
+        # ever in doubt. Split the skipped rows by mechanism, because the
+        # two are repaired by different things:
+        #
+        #   diffusion-only  -- stencil crosses the cut, no vessel involved.
+        #                      This is what the Robin condition is FOR; the
+        #                      rho*G_gamma term is the intended repair.
+        #   coupling        -- C_i^T G C_i row differs from C^T G C. No
+        #                      boundary term repairs this: the row is
+        #                      quantitatively wrong, not just one-sided.
+        d_ad_x = d_m_x = 0.0
+        n_ad_x = n_m_x = 0
+        for dl in range(ps.V.dim()):
+            gr = l2g[dl]
+            cols = Ag.indices[Ag.indptr[gr]:Ag.indptr[gr + 1]]
+            if owned[cols].all():
+                continue
+            for Gm, Lm, acc in ((ADg, ADi, "ad"), (Mg, Mi, "m")):
+                s, e = Gm.indptr[gr], Gm.indptr[gr + 1]
+                gc, gv = Gm.indices[s:e], Gm.data[s:e]
+                # Only columns this box owns can be compared at all; the
+                # rest are the neighbour's half of the row by construction.
+                keep = owned[gc]
+                rg = np.zeros(ps.V.dim())
+                rg[g2l[gc[keep]]] = gv[keep]
+                s2, e2 = Lm.indptr[dl], Lm.indptr[dl + 1]
+                rl = np.zeros(ps.V.dim())
+                rl[Lm.indices[s2:e2]] = Lm.data[s2:e2]
+                dd = float(np.abs(rg - rl).max())
+                if acc == "ad":
+                    d_ad_x = max(d_ad_x, dd)
+                    n_ad_x += dd > 1e-12
+                else:
+                    d_m_x = max(d_m_x, dd)
+                    n_m_x += dd > 1e-12
+        n_skip = ps.V.dim() - n_int
+        print(f"        skipped rows: {n_skip} | "
+              f"diffusion differs on {n_ad_x} (max {d_ad_x:.3e}) | "
+              f"COUPLING differs on {n_m_x} (max {d_m_x:.3e})")
+        sd["_n_bad_coupling"] = n_m_x
+
     # Reference restriction of u* to each box, and the raw local error.
     for sd in subdomains:
         l2g = sd["local_to_global_dof"]
@@ -548,27 +603,13 @@ def main():
         # default clipped quadrature each box renormalizes its own partial
         # arc, and C_v^(i) u_i + C_v^(j) u_j would not reconstruct the true
         # full-circle average.
+        # Built by Robin_residual.build_cross_term, the same routine the
+        # production path uses, so the two cannot drift apart.
         cross = np.zeros(ps.V.dim(), dtype=float)
         if args.cross:
             Ci = ps.C.tocsr()
-
-            # The global equation on box i's rows carries C_i^T G (C u*), with
-            # the FULL C. Box i's own operator supplies C_i^T G (C_i u_i). The
-            # missing piece is therefore
-            #
-            #     C_i^T G (C u* - C_i u_i)
-            #
-            # computed against the global C directly. An earlier version used
-            # C_j u_j for the second factor, which DOUBLE-COUNTS every column
-            # on the cut plane itself: those dofs are owned by both boxes, so
-            # they appear in C_i and in C_j. Subtracting C_i u_i from the true
-            # global average avoids the partition question entirely.
-            #
-            # G is a CG1 mass matrix on the 1D mesh, NOT diagonal -- it couples
-            # neighbouring vessel nodes -- so this is a full matrix product,
-            # not a per-node scalar.
-            far_avg = glob.C.dot(u_star) - Ci.dot(u_i)
-            cross = Ci.T.dot(glob.G.dot(far_avg))
+            Cg = glob.C.tocsr()
+            cross = build_cross_term(ps, Cg, glob.G, Cg.dot(u_star), u_i)
 
             # TWO independent ways the cross term can be nonzero. The x/z cut
             # exercises only the first, the y cut only the second, and an
@@ -578,10 +619,9 @@ def main():
             #     circle but not all of the global row's weight. Geometry of
             #     the CIRCLE vs the plane.
             w_i = np.asarray(np.abs(Ci).sum(axis=1)).ravel()
-            w_g = np.asarray(np.abs(glob.C.tocsr()).sum(axis=1)).ravel()
+            w_g = np.asarray(np.abs(Cg).sum(axis=1)).ravel()
             owns = w_i > 1e-14
-            sd["_n_straddle"] = int(np.count_nonzero(
-                owns & (w_g - w_i > 1e-14 * np.maximum(w_g, 1.0))))
+            sd["_n_straddle"] = count_straddling_nodes(ps, Cg)
 
             # (b) network coupling: G is a CG1 mass matrix on the 1D mesh, so
             #     it has off-diagonal entries between neighbouring vessel
@@ -674,7 +714,12 @@ def main():
     print("  eq. (5) corrected local solve:")
     for sd in subdomains:
         ps = sd["partition_solver"]
-        A_robin = (ps.A + rho * sd["_G_gamma"]).tocsc()
+
+        # Built by the same Robin_residual routine the production path uses.
+        # The coupling missing from A_i is not repaired here and cannot be: it
+        # has all its columns in the neighbour's dofs.
+        A_robin = build_local_operator(ps, rho, sd["_G_gamma"])
+
         # The cross term belongs on the rhs of eq. (5) too: it is part of the
         # equation box i's rows actually satisfy, not only of the extraction.
         rhs_i = (np.asarray(ps.rhs, dtype=float) + sd["_f_in"] + sd["_cross"])

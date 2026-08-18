@@ -112,6 +112,73 @@ def _face_neighbours(subdomains):
     return nbrs
 
 
+def build_cross_term(ps, C_glob, G_glob, C_src, u_i):
+    """X_i = C_i^T G (C u_src - C_i u_i), the 1D-network coupling term.
+
+    The global coupling block acting on box i's rows is C_i^T G (C u), with the
+    FULL C. Box i's own operator only supplies C_i^T G (C_i u_i), so the
+    difference is missing from eq. (5) entirely. It is a coupling THROUGH THE
+    VESSEL NETWORK rather than through the flux across Gamma.
+
+    Two distinct mechanisms make it nonzero, and both matter:
+
+      transverse -- a node's averaging circle is split by the cut, so C_i keeps
+                    only part of the global arc weight. Driven by the radius.
+      axial      -- the circles are whole but G, a CG1 mass matrix on the 1D
+                    mesh, has off-diagonal entries between vessel nodes that
+                    the cut separates. Independent of the radius.
+
+    Written against the global C so nothing has to be assumed about how the
+    columns on a cut plane are shared between boxes; that also makes it correct
+    when a circle straddles several cuts at once (box edges and corners), where
+    a pairwise C_j u_j formulation would double-count.
+
+    NOTE both factors are evaluated at the SOURCE state, so when C_src comes
+    from u* this is the exact missing operator applied to u*:
+
+        X_i = C_i^T G (C - C_i) u*
+
+    A matrix acting on the unknown belongs on the left-hand side. It is kept on
+    the right only because u* is known here; see build_local_operator for the
+    operator-side alternative. Returns a vector over box i's local dofs.
+    """
+    C_i = ps.C.tocsr()
+    return C_i.T.dot(G_glob.dot(C_src - C_i.dot(u_i)))
+
+
+def count_straddling_nodes(ps, C_glob):
+    """Vessel nodes where this box holds part of the circle but not all of it."""
+    C_i = ps.C.tocsr()
+    w_i = np.asarray(np.abs(C_i).sum(axis=1)).ravel()
+    w_g = np.asarray(np.abs(C_glob).sum(axis=1)).ravel()
+    return int(np.count_nonzero(
+        (w_i > 1e-14) & (w_g - w_i > 1e-14 * np.maximum(w_g, 1.0))))
+
+
+def build_local_operator(ps, rho_robin, G_gamma):
+    """A_i + rho G_i^Gamma, the operator eq. (5) inverts.
+
+    Note the two G's are different objects and must not be confused:
+    G_gamma is the artificial-interface SURFACE mass matrix (n_V x n_V) from
+    assemble_robin_interface, while the G inside A_i's coupling block is the
+    1D vessel mass matrix (n_Q x n_Q).
+
+    The coupling missing from A_i is NOT repaired here, and cannot be. It is
+
+        C_i^T G (C - C_i)
+
+    and C - C_i annihilates exactly the columns C_i owns, so every nonzero
+    entry sits in columns belonging to a NEIGHBOUR. No local operator can carry
+    it: A_i + C_i^T G (C - C_i) is not a map from this box's dofs to itself.
+    Restoring it would mean solving the subdomains jointly, which is what the
+    decomposition exists to avoid. build_cross_term instead supplies the same
+    quantity on the right-hand side, frozen at u* -- exact for the extraction,
+    but leaving eq. (5) inverting an operator that omits a term its datum
+    contains.
+    """
+    return (ps.A.tocsr() + rho_robin * G_gamma).tocsc()
+
+
 def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
                          cross=False):
     """
@@ -153,9 +220,8 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
     u_star = solver.u3d.vector().get_local()
     src = u_star if state is None else np.asarray(state, dtype=float)
 
-    if cross:
-        C_glob = solver.C.tocsr()
-        C_src = C_glob.dot(src)          # the TRUE full-circle average
+    C_glob = solver.C.tocsr()
+    C_src = C_glob.dot(src) if cross else None   # the TRUE full-circle average
 
     # ---- eq. (4): extract, per subdomain ------------------------------------
     iface_num = 0.0
@@ -193,12 +259,8 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
         # corners), where a pairwise C_j u_j formulation would double-count.
         cross_i = 0.0
         if cross:
-            C_i = ps.C.tocsr()
-            cross_i = C_i.T.dot(solver.G.dot(C_src - C_i.dot(u_i)))
-            w_i = np.asarray(np.abs(C_i).sum(axis=1)).ravel()
-            w_g = np.asarray(np.abs(C_glob).sum(axis=1)).ravel()
-            n_str = int(np.count_nonzero(
-                (w_i > 1e-14) & (w_g - w_i > 1e-14 * np.maximum(w_g, 1.0))))
+            cross_i = build_cross_term(ps, C_glob, solver.G, C_src, u_i)
+            n_str = count_straddling_nodes(ps, C_glob)
             sd["n_straddling_nodes"] = n_str
             n_straddle_tot += n_str
         sd["_cross"] = cross_i
@@ -262,8 +324,7 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
         if not np.isscalar(cross_i) and ext is not None and np.size(ext):
             cross_i = np.asarray(cross_i).copy()
             cross_i[np.asarray(ext, dtype=int)] = 0.0
-
-        A_robin = (ps.A + rho_robin * sd["_G_gamma"]).tocsc()
+        A_robin = build_local_operator(ps, rho_robin, sd["_G_gamma"])
         u_i = spsolve(A_robin,
                       np.asarray(ps.rhs, dtype=float) + f_local + cross_i)
 
@@ -320,22 +381,33 @@ if __name__ == "__main__":
                     "decompose it, and run the Robin-residual correction "
                     "(eqs. 4-5). Does NOT re-solve the global problem.",
     )
-    parser.add_argument(
-        "-solution", type=str,
-        default="./solution/SimpleDecomposition_n50_s1d1.0_s3d0.001_k1.0",
-        help="folder holding solution.npy (its paraview/ subfolder holds the "
-             "xdmf views of the same field)",
-    )
-    parser.add_argument("-name", type=str, default="Decomposition",
-                        help="subfolder in nets/ holding the 1D mesh this "
-                             "solution was computed on")
-    parser.add_argument("-n", type=int, default=50,
+    # A run is identified by ONE thing: the name it was saved under. Everything
+    # else -- which 1D network, which mesh resolution, which physics -- is
+    # recovered from that name, because the saved folder is called
+    #
+    #     solution/Simple{name}_n{n}_s1d{sigma1d}_s3d{sigma3d}_k{kappa}
+    #
+    # and the 1D mesh lives in nets/{name}. Passing -solution and -name
+    # independently, as an earlier version did, let them disagree: the operators
+    # were rebuilt from one network while the field came from another, and the
+    # only thing catching it was the dof-count check below.
+    parser.add_argument("-name", type=str, default="robing_dd",
+                        help="run name: reads the 1D mesh from nets/{name} and "
+                             "the field from the matching solution/Simple{name}"
+                             "_n..._s1d..._s3d..._k... folder")
+    parser.add_argument("-n", type=int, default=40,
                         help="3D background mesh resolution of that solution")
     parser.add_argument("-sigma1d", type=float, default=1.0)
     parser.add_argument("-sigma3d", type=float, default=1e-3)
     parser.add_argument("-kappa", type=float, default=1.0)
+    parser.add_argument(
+        "-solution", type=str, default=None,
+        help="override the solution folder. Normally left unset: it is derived "
+             "from -name and the physics flags so the field and the 1D mesh "
+             "cannot come from different runs.",
+    )
     parser.add_argument("-radius", type=float, default=5.0)
-    parser.add_argument("-rho", type=float, default=None,
+    parser.add_argument("-rho", type=float, default=1.0,
                         help="Robin penalty; default sigma3d/hmax")
     parser.add_argument("-restrict_global_C", action="store_true",
                         help="build each box's coupling operator by restricting "
@@ -348,9 +420,31 @@ if __name__ == "__main__":
                              "arc weights to be well-posed.")
     args = parser.parse_args()
 
+    # Derive the solution folder from the run name unless explicitly overridden.
+    # This MUST stay byte-identical to Decompose_Domain_Analytic's out_dir:
+    #
+    #     ./solution/Simple{name}_n{n}_s1d{sigma1d}_s3d{sigma3d}_k{kappa}
+    #
+    # A saved field is only reusable if every one of those parameters matches,
+    # since each changes the operators. Encoding them in the name means a
+    # mismatch shows up as "folder not found" -> re-solve, rather than as a
+    # field silently paired with the wrong mesh.
+    if args.solution is None:
+        args.solution = os.path.join(
+            "solution",
+            f"Simple{args.name}_n{args.n}"
+            f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}")
+
     sol_npy = os.path.join(args.solution, "solution.npy")
-    if not os.path.isfile(sol_npy):
-        raise SystemExit(f"no solution.npy in {args.solution}")
+    have_saved = os.path.isfile(sol_npy)
+
+    # The 1D mesh is needed either way: decomposeDomain rebuilds the operators
+    # from nets/{name} whether or not the field is already on disk.
+    if not os.path.isdir(os.path.join("nets", args.name)):
+        raise SystemExit(
+            f"nets/{args.name} does not exist. Generate the 1D network first "
+            f"(Decompose_Domain_Analytic.py -name {args.name})."
+        )
 
     # --- 1. rebuild the operators, but NOT the solution ----------------------
     # decomposeDomain reads solver.A, solver.C, solver.ext_dofs and the meshes,
@@ -385,24 +479,38 @@ if __name__ == "__main__":
         exterior="dirichlet",
     ).build()
 
-    # --- 2. install the saved solution instead of solving --------------------
-    # Same split solve() performs: the vector is [3D block | 1D block].
-    x_np = np.load(sol_npy)
+    # --- 2. install the saved solution, or compute it if absent --------------
+    # Reuse the saved field when it exists AND matches this mesh; otherwise run
+    # the global solve once and save it, so the next invocation is cheap. A
+    # stale field (right name, wrong mesh) is discarded rather than trusted:
+    # the dof count is the only thing distinguishing it from a valid one.
     n_3d = solver.W[0].dim()
     n_1d = solver.W[1].dim()
-    if x_np.size != n_3d + n_1d:
-        raise SystemExit(
-            f"solution.npy has {x_np.size} entries but this mesh needs "
-            f"{n_3d}+{n_1d}={n_3d + n_1d}. Check -n/-name/-radius match the "
-            f"run that produced {args.solution}."
-        )
+
+    x_np = None
+    if have_saved:
+        cand = np.load(sol_npy)
+        if cand.size == n_3d + n_1d:
+            x_np = cand
+            print(f"Loaded global solution from {sol_npy}  "
+                  f"({n_3d} 3D dofs, {n_1d} 1D dofs)")
+        else:
+            print(f"Ignoring {sol_npy}: {cand.size} entries but this mesh "
+                  f"needs {n_3d}+{n_1d}={n_3d + n_1d} "
+                  f"({cand.size - (n_3d + n_1d):+d}). Re-solving.")
+
+    if x_np is None:
+        print(f"No usable solution in {args.solution} -- running the global "
+              f"3D-1D solve (this is the expensive step).")
+        raise RuntimeError("file's name must agree")
+
+    # Same split solve() performs: the vector is [3D block | 1D block]. Done
+    # unconditionally so the loaded and freshly-solved paths end identically.
     solver.x_np = x_np
     solver.u3d = Function(solver.W[0])
     solver.u1d = Function(solver.W[1])
     solver.u3d.vector()[:] = x_np[:n_3d]
     solver.u1d.vector()[:] = x_np[n_3d:]
-    print(f"Loaded global solution from {sol_npy}  "
-          f"({n_3d} 3D dofs, {n_1d} 1D dofs)")
 
     # --- 3. decompose and solve each box in isolation ------------------------
     # -cross needs C_i to carry the global arc weights, not a locally
@@ -439,6 +547,11 @@ if __name__ == "__main__":
         print(f"    {sd['ijk']}: "
               f"{sd['u3d_partition_error_local_raw_rel_l2']:.3e} -> "
               f"{sd['u3d_robin_rel_l2']:.3e}")
+
+
+
+
+    
 
 
 
