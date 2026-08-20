@@ -128,9 +128,9 @@ class Solver3D1D:
         boundary: Boundary | None = None,
         n: int = 10,
         sigma3d: float = 1e-3,
-        sigma1d: float = 10,
+        sigma1d: float = 1.0,
         kappa: float = 1.0,
-        beta_nitsche: float = 5000.0,
+        beta_nitsche: float = 1.0,
         inlet_tag: int = 111,
         exterior: str = "dirichlet",
     ):
@@ -373,7 +373,7 @@ class Solver3D1D:
         beta = Constant(self.beta_nitsche)
         h_E = MaxCellEdgeLength(self.meshQ)
         n_fct = FacetNormal(self.meshQ)
-        p_in = Constant(5.0)
+        p_in = Constant(1.0)
         dx_ = Measure("dx", domain=self.meshQ)
 
         n_V = V.dofmap().global_dimension()

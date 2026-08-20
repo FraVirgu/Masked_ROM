@@ -36,7 +36,7 @@ from dolfin import BoxMesh, Point, MeshFunction
 
 import test_robin_minimal as T
 from Solver_partition_domain import SolverPartitionDomain
-from Robin_residual import _robin_interface
+from Robin_residual_sphere import _robin_interface
 
 
 def main():

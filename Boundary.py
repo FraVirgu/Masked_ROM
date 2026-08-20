@@ -127,6 +127,74 @@ class SphereBoundary(Boundary):
 
 
 
+class CylinderBoundary(Boundary):
+    """Finite circular cylinder, axis-aligned along `axis`.
+
+    Inside is the intersection of the infinite cylinder of radius `radius`
+    about the axis through `center` with the slab of total extent `height`
+    along that axis, i.e. a closed solid capped by two flat discs.
+    """
+
+    _AXES = {"x": 0, "y": 1, "z": 2}
+
+    def __init__(
+        self,
+        radius=1.0,
+        height=2.0,
+        center=(0.0, 0.0, 0.0),
+        axis="z",
+        inlet_points=None,
+        outlet_points=None,
+        border_eps=1e-2,
+    ):
+        self.radius = float(radius)
+        self.height = float(height)
+        self.center = np.asarray(center, dtype=float)
+        if self.radius <= 0.0:
+            raise ValueError("radius must be positive for CylinderBoundary.")
+        if self.height <= 0.0:
+            raise ValueError("height must be positive for CylinderBoundary.")
+        if axis not in self._AXES:
+            raise ValueError(f"axis must be one of {tuple(self._AXES)}.")
+        self.axis = axis
+        ai = self._AXES[axis]
+        self._axis_index = ai
+
+        r, h = self.radius, self.height
+        half = 0.5 * h
+        # The bbox is tight: `radius` in the two transverse directions, half the
+        # height along the axis. Kept for code paths that expect boundary._bbox.
+        ext = [r, r, r]
+        ext[ai] = half
+        self._bbox = tuple(
+            (self.center[d] - ext[d], self.center[d] + ext[d]) for d in range(3)
+        )
+
+        # The two transverse directions -- the ones the radial test applies to.
+        t0, t1 = [d for d in (0, 1, 2) if d != ai]
+        c = self.center
+
+        def inside(x, y, z):
+            p = (x, y, z)
+            radial = (p[t0] - c[t0]) ** 2 + (p[t1] - c[t1]) ** 2
+            return (radial <= r ** 2) and (abs(p[ai] - c[ai]) <= half)
+
+        super().__init__(
+            source=inside,
+            bbox=None,
+            inlet_points=inlet_points,
+            outlet_points=outlet_points,
+            border_eps=border_eps,
+        )
+
+    def __repr__(self):
+        return (
+            f"CylinderBoundary(radius={self.radius!r}, "
+            f"height={self.height!r}, axis={self.axis!r}, "
+            f"center={tuple(self.center)!r})"
+        )
+
+
 np.random.seed(42)
 
 def random_sphere_points(
@@ -151,6 +219,72 @@ def random_sphere_points(
         v *= np.random.uniform(0.0, max_radius)
         if x_sign * v[0] > min_x * radius:
             pts.append(v.tolist())
+    return pts
+
+
+def random_cylinder_points(
+    n,
+    sign,
+    radius=1.0,
+    height=2.0,
+    axis="z",
+    split_axis=None,
+    min_offset=0.2,
+    min_dist_to_boundary=0.06,
+    center=(0.0, 0.0, 0.0),
+):
+    """Sample `n` points strictly inside a CylinderBoundary.
+
+    Mirrors random_sphere_points: `sign` (+1/-1) with `min_offset` keeps the
+    points on one side, so an inlet and an outlet set can be drawn separately.
+    By default the split is along the cylinder axis, giving points near one cap
+    or the other; pass `split_axis` to split transversally instead.
+
+    `min_dist_to_boundary` is honoured on the curved wall AND on both caps, so
+    every point stays off the surface -- inlets sitting exactly on the boundary
+    make the border checks in Boundary ambiguous.
+    """
+    axes = CylinderBoundary._AXES
+    if axis not in axes:
+        raise ValueError(f"axis must be one of {tuple(axes)}.")
+    ai = axes[axis]
+    if split_axis is None:
+        si = ai
+    else:
+        if split_axis not in axes:
+            raise ValueError(f"split_axis must be one of {tuple(axes)}.")
+        si = axes[split_axis]
+
+    radius, height = float(radius), float(height)
+    if radius <= 0.0:
+        raise ValueError("radius must be positive when sampling cylinder points.")
+    if height <= 0.0:
+        raise ValueError("height must be positive when sampling cylinder points.")
+
+    max_radius = radius - min_dist_to_boundary
+    half = 0.5 * height - min_dist_to_boundary
+    if max_radius <= 0.0 or half <= 0.0:
+        raise ValueError(
+            "min_dist_to_boundary must be smaller than the cylinder radius "
+            "and than half its height."
+        )
+
+    # The half-extent along whichever direction the sign test uses.
+    span = half if si == ai else max_radius
+    center = np.asarray(center, dtype=float)
+    t0, t1 = [d for d in (0, 1, 2) if d != ai]
+
+    pts = []
+    while len(pts) < n:
+        # Uniform over the disc: sqrt keeps the density flat in area.
+        theta = np.random.uniform(0.0, 2.0 * np.pi)
+        rr = max_radius * np.sqrt(np.random.uniform(0.0, 1.0))
+        v = np.empty(3)
+        v[t0] = rr * np.cos(theta)
+        v[t1] = rr * np.sin(theta)
+        v[ai] = np.random.uniform(-half, half)
+        if sign * v[si] > min_offset * span:
+            pts.append((center + v).tolist())
     return pts
 
 

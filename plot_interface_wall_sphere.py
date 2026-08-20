@@ -36,18 +36,63 @@ from matplotlib.colors import Normalize
 
 from dolfin import Function
 
-from Decompose_Domain_Analytic import (
+from Decompose_Domain_Analytic_sphere import (
     check_sphere_domain_consistency,
     decomposeDomain,
 )
 from Solver_full_domain import Solver3D1D
 from Boundary import SphereBoundary, random_sphere_points
-from Robin_residual import apply_robin_residual
+from Robin_residual_sphere import apply_robin_residual
 
 
 def plane_dofs(coords, axis, value, tol):
     """Indices of dofs lying on the plane {x_axis = value}."""
     return np.flatnonzero(np.abs(coords[:, axis] - value) < tol)
+
+
+def subdomain_seams(subdomains, axis):
+    """In-plane coordinates of the artificial cuts between boxes.
+
+    The plane normal to `axis` is tiled by every box at fixed index along that
+    axis, so the seams on it are the box edges in the two OTHER directions.
+    The extents are read back from each box's own mesh rather than recomputed
+    from *_ROM_lenght: decomposeDomain snaps them to mesh nodes, so the stored
+    bounds are the only ones that match the drawn field.
+
+    Returns (a_lines, b_lines): seam positions along the two in-plane axes.
+    Outermost bounds are dropped -- those are the domain rim, not a cut.
+    """
+    a, b = [d for d in (0, 1, 2) if d != axis]
+    edges = {a: set(), b: set()}
+    for sd in subdomains:
+        c = (sd["partition_solver"].V.tabulate_dof_coordinates()
+             .reshape((-1, 3)))
+        for d in (a, b):
+            edges[d].add(round(float(c[:, d].min()), 9))
+            edges[d].add(round(float(c[:, d].max()), 9))
+    # An outer bound appears only as a global extreme; interior seams are the
+    # rest, i.e. every box edge that is not the overall min or max.
+    out = []
+    for d in (a, b):
+        e = sorted(edges[d])
+        out.append(e[1:-1] if len(e) > 2 else [])
+    return out[0], out[1]
+
+
+def draw_subdomain_seams(ax, a_lines, b_lines):
+    """Overlay the box-to-box interfaces as faint red dashed lines.
+
+    Kept deliberately subdued: the seams are an annotation on the field, not
+    the subject, so they sit at low alpha and thin. zorder still puts them
+    above the tripcolor mesh -- gouraud shading would otherwise hide them
+    entirely -- but the low alpha lets the colour read through.
+    """
+    style = dict(color="red", linestyle="--", linewidth=0.8, alpha=0.35,
+                 zorder=5)
+    for v in a_lines:
+        ax.axvline(v, **style)
+    for v in b_lines:
+        ax.axhline(v, **style)
 
 
 def surface_plane(ax, coords, vals, axis, norm, cmap, title):
@@ -253,13 +298,23 @@ def main():
     # The two error panels share `enorm`, so their colours are comparable.
     fig.colorbar(s2, ax=axes[1:], shrink=0.85, label="|error|")
 
+    a_lines, b_lines = subdomain_seams(idx_lo + idx_hi, ax_i)
+    print(f"subdomain seams on the plane: {len(a_lines)} + {len(b_lines)}")
+    for ax in axes:
+        # Freeze the data limits first: axvline/axhline span the full axis and
+        # would otherwise let a seam at the rim rescale the panel.
+        ax.set_xlim(ax.get_xlim())
+        ax.set_ylim(ax.get_ylim())
+        draw_subdomain_seams(ax, a_lines, b_lines)
+
+    # The figure-wide banner is gone by request; the same numbers still go to
+    # stdout below, so nothing is lost -- it is only off the image.
     sub = ", ".join(str(sd["ijk"]) for sd in idx_lo + idx_hi)
-    fig.suptitle(
-        f"{args.name}: artificial wall {args.axis}={cut:.2f}, boxes {sub}\n"
-        f"raw {np.mean([sd['u3d_partition_error_local_raw_rel_l2'] for sd in subdomains]):.3e}"
-        f"  ->  corrected {result['rel_local']:.3e}"
-        f"   (interface support {result['iface_fraction']:.1%})",
-        fontsize=11)
+    print(f"boxes on the wall: {sub}")
+    print(f"global: raw "
+          f"{np.mean([sd['u3d_partition_error_local_raw_rel_l2'] for sd in subdomains]):.3e}"
+          f"  ->  corrected {result['rel_local']:.3e}"
+          f"   (interface support {result['iface_fraction']:.1%})")
 
     out = args.out or f"interface_wall_{args.name}_{args.axis}.png"
     fig.savefig(out, dpi=160)

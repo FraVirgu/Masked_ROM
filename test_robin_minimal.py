@@ -71,8 +71,8 @@ from dolfin import (
 
 from Solver_partition_domain import SolverPartitionDomain
 from Solver_full_domain import Solver3D1D
-from Decompose_Domain_Analytic import matrix_to_csr
-from Robin_residual import (
+from Decompose_Domain_Analytic_sphere import matrix_to_csr
+from Robin_residual_sphere import (
     _robin_interface,
     build_cross_term,
     build_local_operator,

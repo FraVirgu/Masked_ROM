@@ -45,7 +45,7 @@ from scipy.sparse.linalg import spsolve
 
 from dolfin import Function
 
-from Decompose_Domain_Analytic import (
+from Decompose_Domain_Analytic_sphere import (
     mark_artificial_facets,
     assemble_robin_interface,
 )
@@ -368,7 +368,7 @@ if __name__ == "__main__":
     import argparse
     import os
 
-    from Decompose_Domain_Analytic import (
+    from Decompose_Domain_Analytic_sphere import (
         check_sphere_domain_consistency,
         decomposeDomain,
     )

@@ -33,7 +33,7 @@ from scipy.sparse.linalg import splu
 
 from dolfin import Function
 
-from Robin_residual import _robin_interface
+from Robin_residual_sphere import _robin_interface
 
 
 def solve_schwarz_robin(
@@ -197,7 +197,7 @@ if __name__ == "__main__":
     import os
     import argparse
 
-    from Decompose_Domain_Analytic import (
+    from Decompose_Domain_Analytic_sphere import (
         check_sphere_domain_consistency,
         decomposeDomain,
     )

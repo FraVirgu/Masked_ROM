@@ -861,9 +861,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("-name",   type=str, required=True,
                         help="subfolder name inside nets/ (e.g. sphere01)")
-    parser.add_argument("-inlet",  type=int, default=10,
+    parser.add_argument("-inlet",  type=int, default=15,
                         help="number of inflow vessels (n_vasi)")
-    parser.add_argument("-outlet", type=int, default=10,
+    parser.add_argument("-outlet", type=int, default=15,
                         help="ramifications per vessel (n_ramifications)")
     parser.add_argument("-n",      type=int, default=40,
                         help="3D background mesh resolution")
@@ -873,7 +873,7 @@ if __name__ == "__main__":
                         help="3D conductivity (sigma3d)")
     parser.add_argument("-kappa", type=float, default=1.0,
                         help="coupling coefficient (kappa)")
-    parser.add_argument("-radius", type=float, default=5.0,
+    parser.add_argument("-radius", type=float, default=1.0,
                         help="radius of the spherical boundary")
     args = parser.parse_args()
 
