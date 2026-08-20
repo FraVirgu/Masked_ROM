@@ -140,7 +140,9 @@ def main():
     ap.add_argument("-sigma3d", type=float, default=1e-3)
     ap.add_argument("-kappa", type=float, default=1.0)
     ap.add_argument("-radius", type=float, default=5.0)
-    ap.add_argument("-rho", type=float, default=1.0)
+    # None => sigma3d/hmax. Leave unset: rho=1.0 over-penalizes by ~600x and
+    # the correction degrades every box (see Robin_residual_sphere -rho help).
+    ap.add_argument("-rho", type=float, default=None)
     ap.add_argument("-axis", choices=("x", "y", "z"), default="y",
                     help="normal of the cut plane to draw")
     ap.add_argument("-restrict_global_C", action="store_true")
@@ -315,6 +317,10 @@ def main():
           f"{np.mean([sd['u3d_partition_error_local_raw_rel_l2'] for sd in subdomains]):.3e}"
           f"  ->  corrected {result['rel_local']:.3e}"
           f"   (interface support {result['iface_fraction']:.1%})")
+    print(f"eq.(5) solve: max residual "
+          f"{max(sd['_solve_res'] for sd in subdomains):.2e}  (must be ~1e-12)"
+          f" | min |diag| {min(sd['_diag_min'] for sd in subdomains):.2e}"
+          f" | nonfinite {sum(sd['_n_nonfinite'] for sd in subdomains)}")
 
     out = args.out or f"interface_wall_{args.name}_{args.axis}.png"
     fig.savefig(out, dpi=160)

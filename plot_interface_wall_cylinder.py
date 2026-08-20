@@ -70,7 +70,9 @@ def main():
                     help="direction of the cylinder axis (the geometry)")
     ap.add_argument("-parts", type=int, default=2,
                     help="subdomains per direction")
-    ap.add_argument("-rho", type=float, default=1.0)
+    # None => sigma3d/hmax. Leave unset: rho=1.0 over-penalizes by ~600x and
+    # the correction degrades every box (see Robin_residual_sphere -rho help).
+    ap.add_argument("-rho", type=float, default=None)
     ap.add_argument("-axis", choices=("x", "y", "z"), default="y",
                     help="normal of the cut plane to draw (the view)")
     ap.add_argument("-restrict_global_C", action="store_true")

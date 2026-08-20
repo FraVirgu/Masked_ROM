@@ -6,7 +6,9 @@ from dolfin import (
     Mesh, MeshEditor, MeshFunction, File, Point, BoxMesh,
     XDMFFile, MPI, cells
 )
-from Boundary import Boundary, random_sphere_points
+from Boundary import Boundary, SphereBoundary, random_sphere_points
+
+from Solver_full_domain import Solver3D1D
 
 class Domain:
     """
@@ -632,3 +634,141 @@ class Domain:
         )
     
 
+
+def check_sphere_domain_consistency(boundary, n_min, n_max, atol=1e-12):
+    if not hasattr(boundary, "_bbox"):
+        raise RuntimeError("Boundary has no _bbox; cannot verify consistency.")
+
+    bbox = boundary._bbox
+    domain_center = 0.5 * (n_min + n_max)
+    domain_len = n_max - n_min
+
+    for axis, (bmin, bmax) in zip(("x", "y", "z"), bbox):
+        axis_center = 0.5 * (bmin + bmax)
+        axis_len = bmax - bmin
+
+        if not np.isclose(axis_center, domain_center, atol=atol, rtol=0.0):
+            raise RuntimeError(
+                f"Inconsistent {axis}-center: boundary bbox center={axis_center}, "
+                f"domain center={domain_center}."
+            )
+        if not np.isclose(axis_len, domain_len, atol=atol, rtol=0.0):
+            raise RuntimeError(
+                f"Inconsistent {axis}-length: boundary bbox length={axis_len}, "
+                f"domain length={domain_len}."
+            )
+
+    if hasattr(boundary, "radius"):
+        expected_len = 2.0 * float(boundary.radius)
+        if not np.isclose(domain_len, expected_len, atol=atol, rtol=0.0):
+            raise RuntimeError(
+                f"Inconsistent sphere radius: 2*radius={expected_len} but "
+                f"domain length={domain_len}."
+            )
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+if __name__ == "__main__":
+    import os
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Build a simple analytic (non-OpenCCO) vascular domain and "
+                    "solve the 3D-1D problem with the no-penalty solver.",
+    )
+    parser.add_argument("-name",   type=str, required=True,
+                        help="subfolder name inside nets/ (e.g. sphere01)")
+    parser.add_argument("-inlet",  type=int, default=10,
+                        help="number of inflow vessels (n_vasi)")
+    parser.add_argument("-outlet", type=int, default=10,
+                        help="ramifications per vessel (n_ramifications)")
+    parser.add_argument("-n",      type=int, default=30,
+                        help="3D background mesh resolution")
+    parser.add_argument("-sigma1d", type=float, default=1.0,
+                        help="1D conductivity (sigma1d)")
+    parser.add_argument("-sigma3d", type=float, default=1e-3,
+                        help="3D conductivity (sigma3d)")
+    parser.add_argument("-kappa", type=float, default=1.0,
+                        help="coupling coefficient (kappa)")
+    parser.add_argument("-radius", type=float, default=2.0,
+                            help="radius of the spherical boundary")
+    args = parser.parse_args()
+
+    # nets/{name}/ holds every mesh file this run writes and the solver reads.
+    #
+    # Domain's export_* methods build filenames as f"{self.name}_marked_mesh.xdmf"
+    # (i.e. they add the trailing '_'), while the solver reads them back as
+    # f"{path_to_1D_mesh}marked_mesh.xdmf" (no added '_'). So self.name must NOT
+    # end in '_', and path_to_1D_mesh MUST — otherwise the underscores don't line
+    # up and the solver looks for a file the domain never wrote.
+    net_dir = os.path.join("nets", args.name)
+    os.makedirs(net_dir, exist_ok=True)
+    name_stem = os.path.join(net_dir, args.name)   # nets/NAME/NAME      (no trailing _)
+    mesh_prefix = f"{name_stem}_"                   # nets/NAME/NAME_     (solver prefix)
+
+
+
+    
+    boundary = SphereBoundary(
+        radius=args.radius,
+        inlet_points=random_sphere_points(
+            40,
+            x_sign=-1,
+            min_x=0.2,
+            min_dist_to_boundary=0.06,
+            radius=args.radius,
+        ),
+        outlet_points=random_sphere_points(
+            40,
+            x_sign=+1,
+            min_x=0.2,
+            min_dist_to_boundary=0.06,
+            radius=args.radius,
+        ),
+        border_eps=10e-1,
+    )
+    
+    check_sphere_domain_consistency(
+        boundary=boundary,
+        n_min=-args.radius,
+        n_max=args.radius,
+    )
+    
+
+    
+    # --- 1. build the analytic-boundary domain (unit sphere from Boundary.py) ---
+    domain = Domain(
+        name            = name_stem,
+        n_vasi          = args.inlet,
+        n_ramifications = args.outlet,
+        boundary        = boundary,
+    ).build()
+
+    domain.export_box()
+    domain.export_reticolo()
+    domain.export_vaso()
+    domain.export_xdmf()
+
+    # --- 2. run the solver WITHOUT the boundary penalty ---
+    # exterior='dirichlet' eliminates the exterior DOFs exactly instead of
+    # pinning them with a penalty term, so the interface is not contaminated.
+    out_dir = (
+        f"./solution/Simple{args.name}_n{args.n}"
+        f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}"
+    )
+    solver  = Solver3D1D(
+        path_to_1D_mesh = mesh_prefix,
+        boundary        = boundary,
+        n               = args.n,
+        sigma3d         = args.sigma3d,
+        sigma1d         = args.sigma1d,
+        kappa           = args.kappa,
+        exterior        = "dirichlet",
+    ).build().solve()
+
+    solver.save(out_dir)
+    solver.save_paraview(f"{out_dir}/paraview")

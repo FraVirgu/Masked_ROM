@@ -273,6 +273,7 @@ class Solver3D1D:
             else:
                 bbox = self.boundary._bbox
                 (xmin, xmax), (ymin, ymax), (zmin, zmax) = bbox
+                print(f"Full domain mesh: bounding box = [{xmin:.3f}, {xmax:.3f}] x [{ymin:.3f}, {ymax:.3f}] x [{zmin:.3f}, {zmax:.3f}]")
                 self.meshV = BoxMesh(Point(xmin, ymin, zmin), Point(xmax, ymax, zmax), self.n, self.n, self.n)
         else:
             self.meshV = self.full_domain_mesh

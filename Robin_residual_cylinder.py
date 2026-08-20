@@ -90,8 +90,11 @@ if __name__ == "__main__":
                         help="subdomains per direction; the ROM lengths are "
                              "derived from the extents so a non-cubic cylinder "
                              "still splits evenly")
-    parser.add_argument("-rho", type=float, default=1.0,
-                        help="Robin penalty; default sigma3d/hmax")
+    parser.add_argument("-rho", type=float, default=None,
+                        help="Robin penalty; default sigma3d/hmax. Leave unset "
+                             "unless sweeping: rho=1.0 (the old default) "
+                             "over-penalizes by ~600x for sigma3d=1e-3 and the "
+                             "correction degrades every subdomain.")
     parser.add_argument("-restrict_global_C", action="store_true",
                         help="build each box's coupling operator by restricting "
                              "the global C instead of re-running clipped local "

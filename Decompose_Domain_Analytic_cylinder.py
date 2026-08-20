@@ -225,20 +225,11 @@ if __name__ == "__main__":
         border_eps=10e-1,
     )
 
-    bounds = cylinder_bbox(args.radius, args.height, args.axis)
-    check_cylinder_domain_consistency(boundary=boundary, bounds=bounds)
-
-    # --- 1. build the analytic-boundary domain --------------------------------
-    n_min, n_max = enclosing_cube(args.radius, args.height, args.axis)
-    print(f"cylinder r={args.radius} h={args.height} axis={args.axis}  ->  "
-          f"background cube [{n_min}, {n_max}]^3 at n={args.n}")
-
     domain = Domain(
         name            = name_stem,
         n_vasi          = args.inlet,
         n_ramifications = args.outlet,
         boundary        = boundary,
-        n_min = n_min, n_max = n_max
     ).build()
 
     domain.export_box()

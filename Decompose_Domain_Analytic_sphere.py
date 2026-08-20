@@ -9,6 +9,8 @@ from scipy.sparse import issparse
 
 from dolfin import (
     BoxMesh,
+    Mesh,
+    MeshEditor,
     Point,
     FunctionSpace,
     Function,
@@ -252,11 +254,34 @@ def eliminate_exterior_local(
     if ext_dofs.size == 0:
         partition_solver.ext_dofs = ext_dofs
         partition_solver.int_dofs = int_dofs
+        partition_solver.C_dropped_ext = 0.0
         return 0, int(int_dofs.size)
 
     Asp = partition_solver.A.tocoo()
     is_ext = np.zeros(n, dtype=bool)
     is_ext[ext_dofs] = True
+
+    # Drop C's exterior columns, exactly as Solver3D1D does globally before it
+    # builds M00 (see Solver_full_domain._eliminate_exterior). A_i is stripped
+    # below by hand, so its coupling block no longer reaches these dofs; leaving
+    # the weight in C_i would make ps.A and ps.C describe DIFFERENT operators.
+    # That matters because the Robin cross term is built from ps.C directly:
+    #
+    #     X_i = C_i^T G (C u* - C_i u_i)
+    #
+    # An un-stripped C_i reads u_i on dofs A_i has pinned to zero and writes the
+    # result back onto their rows, so eq. (4)'s residual b_i - A_i u_i - X_i
+    # mixes two inconsistent operators. The pollution lands on the exterior dofs
+    # AND on every interior dof coupled to them through C_i^T G C_i.
+    Ccoo = partition_solver.C.tocoo()
+    drop_c = is_ext[Ccoo.col]
+    partition_solver.C_dropped_ext = float(np.abs(Ccoo.data[drop_c]).sum())
+    C_new = csr_matrix(
+        (Ccoo.data[~drop_c], (Ccoo.row[~drop_c], Ccoo.col[~drop_c])),
+        shape=partition_solver.C.shape,
+    )
+    C_new.eliminate_zeros()
+    partition_solver.C = C_new
 
     keep = ~(is_ext[Asp.row] | is_ext[Asp.col])
     rows = np.concatenate([Asp.row[keep], ext_dofs])
@@ -358,6 +383,12 @@ def solve_partition_domain(
         )
         subdomain["exterior_dofs_eliminated"] = n_ext
         subdomain["interior_dofs_kept"] = n_int
+        # Arc weight that sat on locally-eliminated dofs. The global solve drops
+        # 0.0 here (no vessel leaves the sphere), so anything nonzero is weight
+        # this box alone considers exterior -- i.e. vessel mass the restricted C
+        # kept on dofs A_i has pinned. Should be ~0 once the two agree.
+        subdomain["C_dropped_ext"] = float(
+            getattr(partition_solver, "C_dropped_ext", 0.0))
 
         partition_solver.solve()
         subdomain["partition_solver"] = partition_solver
@@ -556,6 +587,69 @@ def solve_partition_domain(
 
 
 
+def build_submesh_from_global(meshV, global_markers, lo, hi, tol=1e-9):
+    """Carve a box out of the GLOBAL mesh, keeping its tetrahedra intact.
+
+    The alternative -- a fresh BoxMesh on the same corners -- gives the same
+    VERTICES but not the same tetrahedra: BoxMesh splits each hex into 6 tets
+    along a diagonal chosen from the cell's index within that mesh, and a cell
+    at global index (10,10,10) is at local index (0,0,0) in its box. Marking
+    then happens by cell midpoint, so two differently-split tets over the same
+    eight corners can land on opposite sides of the sphere surface. That
+    disagreement is what leaves dofs the global solve supports but the box
+    cannot -- 72 of them at n=40, carrying ||u*||=0.34 straight into eq. (4)'s
+    residual where P^Gamma discards it.
+
+    Selecting global cells by midpoint and rebuilding from exactly those keeps
+    the triangulation, so the marker of each local cell is COPIED from the
+    global one rather than recomputed: the two can no longer disagree.
+
+    Returns (mesh, markers, vertex_coords) where markers carries the inherited
+    tags and vertex_coords are the kept vertices in local index order.
+    """
+    coords = meshV.coordinates()
+    cells_g = meshV.cells()
+
+    # A cell belongs to the box iff its midpoint does -- the same test the
+    # global marking uses, so a cell is never split between two boxes.
+    mids = coords[cells_g].mean(axis=1)
+    inbox = np.ones(cells_g.shape[0], dtype=bool)
+    for d in range(3):
+        inbox &= (mids[:, d] >= lo[d] - tol) & (mids[:, d] <= hi[d] + tol)
+    keep_cells = np.flatnonzero(inbox)
+    if keep_cells.size == 0:
+        raise RuntimeError(f"No global cells fall in box {lo} .. {hi}.")
+
+    # Compact the vertices those cells use, preserving global vertex order so
+    # the local numbering is deterministic.
+    used = np.unique(cells_g[keep_cells].ravel())
+    g2l = -np.ones(coords.shape[0], dtype=np.int64)
+    g2l[used] = np.arange(used.size)
+    local_cells = g2l[cells_g[keep_cells]]
+    local_coords = coords[used]
+
+    mesh = Mesh()
+    ed = MeshEditor()
+    ed.open(mesh, "tetrahedron", 3, 3)
+    ed.init_vertices(int(used.size))
+    ed.init_cells(int(keep_cells.size))
+    for vi, xyz in enumerate(local_coords):
+        ed.add_vertex(vi, Point(float(xyz[0]), float(xyz[1]), float(xyz[2])))
+    for ci, cv in enumerate(local_cells):
+        ed.add_cell(ci, np.asarray(cv, dtype=np.uintp))
+    ed.close()
+
+    # Inherit the tags cell-for-cell: keep_cells[ci] is the global twin of ci,
+    # and MeshEditor preserves the order cells were added in.
+    markers = MeshFunction("size_t", mesh, 3, 0)
+    m_arr = markers.array()
+    g_arr = global_markers.array()
+    m_arr[:] = g_arr[keep_cells]
+    markers.set_values(m_arr)
+
+    return mesh, markers, local_coords
+
+
 def decomposeDomain(
     solver,
     boundary,
@@ -563,6 +657,7 @@ def decomposeDomain(
     y_ROM_lenght=5.0,
     z_ROM_lenght=5.0,
     restrict_global_C=False,
+    submesh=True,
 ):
     """Build the subdomains and solve each one in isolation.
 
@@ -693,41 +788,61 @@ def decomposeDomain(
                 ny = max(1, y_stop - y_start)
                 nz = max(1, z_stop - z_start)
 
-                meshV_sub = BoxMesh(
-                    Point(x_min, y_min, z_min),
-                    Point(x_max, y_max, z_max),
-                    nx, ny, nz,
-                )
+                if submesh:
+                    # Carve the box out of the global mesh so the tetrahedra --
+                    # and therefore the cell markers -- are the global ones.
+                    meshV_sub, V_cell_markers_sub, _ = build_submesh_from_global(
+                        meshV,
+                        solver.V_cell_markers,
+                        (x_min, y_min, z_min),
+                        (x_max, y_max, z_max),
+                    )
+                    inside_count_sub = int(np.count_nonzero(
+                        V_cell_markers_sub.array() == 222))
+                else:
+                    # Legacy path: a fresh BoxMesh re-tetrahedralized from the
+                    # same corners, then re-marked by midpoint. Kept so the old
+                    # behaviour stays reproducible -- see build_submesh_from_global
+                    # for why the two disagree near the sphere surface.
+                    meshV_sub = BoxMesh(
+                        Point(x_min, y_min, z_min),
+                        Point(x_max, y_max, z_max),
+                        nx, ny, nz,
+                    )
 
-                # Mark cells with the SAME criterion as Solver3D1D: default 111
-                # (exterior), 222 only where the cell midpoint is inside the
-                # analytic boundary. Marking every cell 222 makes each box solve
-                # the PDE across regions that lie outside the physical domain,
-                # where the full-domain reference is identically zero.
-                V_cell_markers_sub = MeshFunction("size_t", meshV_sub, 3, 111)
-                inside_count_sub = 0
-                for cell in cells(meshV_sub):
-                    mp = cell.midpoint()
-                    if boundary is None or boundary([mp.x(), mp.y(), mp.z()]):
-                        V_cell_markers_sub[cell] = 222
-                        inside_count_sub += 1
+                    # Mark cells with the SAME criterion as Solver3D1D: default
+                    # 111 (exterior), 222 only where the cell midpoint is inside
+                    # the analytic boundary. Marking every cell 222 makes each
+                    # box solve the PDE across regions that lie outside the
+                    # physical domain, where the reference is identically zero.
+                    V_cell_markers_sub = MeshFunction("size_t", meshV_sub, 3, 111)
+                    inside_count_sub = 0
+                    for cell in cells(meshV_sub):
+                        mp = cell.midpoint()
+                        if boundary is None or boundary([mp.x(), mp.y(), mp.z()]):
+                            V_cell_markers_sub[cell] = 222
+                            inside_count_sub += 1
 
                 V_sub = FunctionSpace(meshV_sub, "CG", 1)
                 sol_3d_sub = Function(V_sub)
                 sub_coords_local = V_sub.tabulate_dof_coordinates().reshape((V_sub.dim(), -1))
-                local_min = sub_coords_local.min(axis=0)
-                local_max = sub_coords_local.max(axis=0)
-                local_span = np.where(local_max > local_min, local_max - local_min, 1.0)
-                target_min = np.array([x_min, y_min, z_min], dtype=float)
-                target_max = np.array([x_max, y_max, z_max], dtype=float)
-                sub_coords = target_min + (sub_coords_local - local_min) * (
-                    (target_max - target_min) / local_span
-                )
-                sol_3d_sub.vector()[:] = np.array(
-                    [sol_3d(Point(*xyz)) for xyz in sub_coords],
-                    dtype=float,
-                )
-
+                if submesh:
+                    # The submesh carries the global vertices verbatim, so its
+                    # dof coordinates ARE global coordinates. Rescaling them to
+                    # the nominal box (below) would be wrong here: a box whose
+                    # cells reach past a nominal corner spans slightly more than
+                    # [x_min, x_max], and stretching that onto the corners would
+                    # shift every dof off the grid and break the triplet lookup.
+                    sub_coords = sub_coords_local
+                else:
+                    local_min = sub_coords_local.min(axis=0)
+                    local_max = sub_coords_local.max(axis=0)
+                    local_span = np.where(local_max > local_min, local_max - local_min, 1.0)
+                    target_min = np.array([x_min, y_min, z_min], dtype=float)
+                    target_max = np.array([x_max, y_max, z_max], dtype=float)
+                    sub_coords = target_min + (sub_coords_local - local_min) * (
+                        (target_max - target_min) / local_span
+                    )
                 local_to_global_dof = np.array(
                     [
                         triplet_to_global_dof[
@@ -741,6 +856,19 @@ def decomposeDomain(
                     ],
                     dtype=int,
                 )
+
+                if submesh:
+                    # l2g is exact here, so take u* by index instead of by
+                    # point evaluation: sol_3d(Point) walks the bounding-box
+                    # tree and interpolates, which on a dof that sits exactly on
+                    # a facet can pick either neighbouring cell. Indexing cannot.
+                    sol_3d_sub.vector()[:] = sol_3d.vector().get_local()[
+                        local_to_global_dof]
+                else:
+                    sol_3d_sub.vector()[:] = np.array(
+                        [sol_3d(Point(*xyz)) for xyz in sub_coords],
+                        dtype=float,
+                    )
 
                 subdomains.append({
                     "ijk": (i, j, k),
@@ -873,7 +1001,7 @@ if __name__ == "__main__":
                         help="3D conductivity (sigma3d)")
     parser.add_argument("-kappa", type=float, default=1.0,
                         help="coupling coefficient (kappa)")
-    parser.add_argument("-radius", type=float, default=1.0,
+    parser.add_argument("-radius", type=float, default=5.0,
                         help="radius of the spherical boundary")
     args = parser.parse_args()
 
@@ -891,6 +1019,7 @@ if __name__ == "__main__":
 
     
 
+    
     boundary = SphereBoundary(
         radius=args.radius,
         inlet_points=random_sphere_points(
@@ -909,20 +1038,25 @@ if __name__ == "__main__":
         ),
         border_eps=10e-1,
     )
-
+    
     check_sphere_domain_consistency(
         boundary=boundary,
         n_min=-args.radius,
         n_max=args.radius,
     )
+    
 
+    
     # --- 1. build the analytic-boundary domain (unit sphere from Boundary.py) ---
     domain = Domain(
         name            = name_stem,
         n_vasi          = args.inlet,
         n_ramifications = args.outlet,
         boundary        = boundary,
-        n_min = -args.radius, n_max = args.radius
+        radius_mean = 0.005,
+        radius_std  = 0.001,
+        radius_min  = 0.001,
+        radius_max  = 0.01,
     ).build()
 
     domain.export_box()

@@ -226,6 +226,12 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
     # ---- eq. (4): extract, per subdomain ------------------------------------
     iface_num = 0.0
     iface_den = 0.0
+    ext_num = 0.0
+    full_den = 0.0
+    resid_gap = 0.0
+    u_unsup = 0.0
+    u_gext = 0.0
+    n_unsup_tot = 0
     n_straddle_tot = 0
 
     for sd in subdomains:
@@ -277,6 +283,31 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
         iface_num += float(np.linalg.norm(r_i[sel & live])) ** 2
         iface_den += float(np.linalg.norm(r_i[live])) ** 2
 
+        # The `live` mask above deletes ~43% of the dofs BEFORE measuring, so
+        # iface_fraction cannot see a residual concentrated on eliminated dofs
+        # -- it reported 100% while A_i and C_i were inconsistent there. Measure
+        # that part separately: A_i pins u=0 on ext_dofs and the rhs is zeroed
+        # there, so r_i must vanish on them up to roundoff. Anything else means
+        # the extraction is invalid no matter what iface_fraction says.
+        ext_num += float(np.linalg.norm(r_i[~live])) ** 2
+        full_den += float(np.linalg.norm(r_i)) ** 2
+
+        # Where does that eliminated-dof residual come from? Two questions.
+        #  (1) is it just -u*? A_i has a unit diagonal there and b_i is zeroed,
+        #      so r_i = -u_i unless G_gamma or the cross term writes there too.
+        #  (2) which half of the eliminated union owns it -- dofs the GLOBAL
+        #      solve also drops (u* should be 0 there), or dofs only this box
+        #      cannot support (u* is genuinely nonzero: a meshing artifact)?
+        if np.any(~live):
+            resid_gap += float(np.linalg.norm(r_i[~live] + u_i[~live])) ** 2
+            unsup = np.asarray(
+                getattr(ps, "unsupported_interior", np.zeros(0, int)), dtype=int)
+            is_unsup = np.zeros(r_i.size, dtype=bool)
+            is_unsup[unsup] = True
+            n_unsup_tot += int(unsup.size)
+            u_unsup += float(np.linalg.norm(u_i[is_unsup])) ** 2
+            u_gext += float(np.linalg.norm(u_i[~live & ~is_unsup])) ** 2
+
         f_star = np.zeros(n_global, dtype=float)
         f_star[l2g] = np.where(sel, r_i, 0.0)
         sd["f_star_minus"] = f_star
@@ -325,8 +356,22 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
             cross_i = np.asarray(cross_i).copy()
             cross_i[np.asarray(ext, dtype=int)] = 0.0
         A_robin = build_local_operator(ps, rho_robin, sd["_G_gamma"])
-        u_i = spsolve(A_robin,
-                      np.asarray(ps.rhs, dtype=float) + f_local + cross_i)
+        b_i5 = np.asarray(ps.rhs, dtype=float) + f_local + cross_i
+        u_i = spsolve(A_robin, b_i5)
+
+        # Is eq. (5) actually being solved? Repeated identical runs gave
+        # corrected errors differing by 2.6x with a bit-identical extraction,
+        # which is the signature of spsolve pivoting differently on a
+        # near-singular operator (SuperLU returns nan/inf on an exactly
+        # singular one, silently apart from a stderr warning). Three checks:
+        #   solve residual -- must be ~1e-12, else the answer is meaningless
+        #   diag_min       -- ~0 means a structurally empty row survived
+        #   nonfinite      -- a single inf explains a jumping max-error
+        n_b = float(np.linalg.norm(b_i5))
+        sd["_solve_res"] = (float(np.linalg.norm(A_robin @ u_i - b_i5))
+                            / max(n_b, 1e-30))
+        sd["_diag_min"] = float(np.abs(A_robin.diagonal()).min())
+        sd["_n_nonfinite"] = int(np.count_nonzero(~np.isfinite(u_i)))
 
         fn = Function(ps.V)
         fn.vector()[:] = u_i
@@ -360,6 +405,18 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
         # to mean anything.
         "iface_fraction": (float(np.sqrt(iface_num) / np.sqrt(iface_den))
                            if iface_den > 0.0 else 0.0),
+        # Share of the residual sitting on eliminated dofs, measured on the FULL
+        # residual (no `live` mask). Must be ~0: A_i is pinned there. A large
+        # value means A_i and C_i disagree, which iface_fraction cannot detect.
+        "ext_fraction": (float(np.sqrt(ext_num) / np.sqrt(full_den))
+                         if full_den > 0.0 else 0.0),
+        # Test 1: ||r_i + u_i|| on eliminated dofs, relative. ~0 => pure -u*.
+        "ext_resid_gap": (float(np.sqrt(resid_gap) / np.sqrt(ext_num))
+                          if ext_num > 0.0 else 0.0),
+        # Test 2: how the u* on eliminated dofs splits between the two causes.
+        "n_unsupported": n_unsup_tot,
+        "u_unsupported": float(np.sqrt(u_unsup)),
+        "u_global_ext": float(np.sqrt(u_gext)),
         "n_straddling_nodes": n_straddle_tot,
     }
 
@@ -407,8 +464,15 @@ if __name__ == "__main__":
              "cannot come from different runs.",
     )
     parser.add_argument("-radius", type=float, default=5.0)
-    parser.add_argument("-rho", type=float, default=1.0,
-                        help="Robin penalty; default sigma3d/hmax")
+    parser.add_argument("-rho", type=float, default=None,
+                        help="Robin penalty; default sigma3d/hmax, the scale "
+                             "that balances the two terms of the residual. "
+                             "This MUST be left unset unless you are sweeping: "
+                             "at rho=1.0 (the old default, ~600x too large for "
+                             "sigma3d=1e-3) the penalty swamps b_i - A_i u*, "
+                             "iface_fraction reads a meaningless 100%%, and the "
+                             "correction degrades every subdomain instead of "
+                             "improving it.")
     parser.add_argument("-restrict_global_C", action="store_true",
                         help="build each box's coupling operator by restricting "
                              "the global C instead of re-running clipped local "
@@ -534,6 +598,18 @@ if __name__ == "__main__":
     # residual, so this fraction must be ~100% for the extraction to be valid.
     print(f"  residual on artificial interface: "
           f"{result['iface_fraction']:.1%}   (eq. 4 requires ~100%)")
+    print(f"  residual on eliminated dofs:      "
+          f"{result['ext_fraction']:.1%}   (must be ~0%)")
+    print(f"    ||r + u|| there (rel):          "
+          f"{result['ext_resid_gap']:.2e}   (~0 => residual is pure -u*)")
+    print(f"    ||u*|| on locally-unsupported:  "
+          f"{result['u_unsupported']:.3e}  ({result['n_unsupported']} dofs)")
+    print(f"    ||u*|| on globally-exterior:    "
+          f"{result['u_global_ext']:.3e}  (should be ~0)")
+    print(f"  eq.(5) solve: max residual {max(sd['_solve_res'] for sd in subdomains):.2e}"
+          f"  (must be ~1e-12)")
+    print(f"                min |diag|   {min(sd['_diag_min'] for sd in subdomains):.2e}"
+          f"  | nonfinite dofs {sum(sd['_n_nonfinite'] for sd in subdomains)}")
     if args.cross:
         print(f"  straddling vessel nodes corrected: "
               f"{result['n_straddling_nodes']}")
