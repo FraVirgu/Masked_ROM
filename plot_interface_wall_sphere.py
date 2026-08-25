@@ -253,9 +253,11 @@ def main():
     # ---- gather the same plane from every box that touches it --------------
     # Also returns u* at the SAME dofs, via local_to_global_dof, so the error
     # panels compare like with like rather than interpolating.
+    # `owner` records which box each plane point came from, so the wall error
+    # can be broken down per subdomain instead of pooled into one array.
     def collect(field_key):
-        pts, vals, ref = [], [], []
-        for sd in idx_lo + idx_hi:
+        pts, vals, ref, owner = [], [], [], []
+        for b, sd in enumerate(idx_lo + idx_hi):
             ps = sd["partition_solver"]
             l2g = sd["local_to_global_dof"]
             c = ps.V.tabulate_dof_coordinates().reshape((ps.V.dim(), -1))
@@ -270,10 +272,12 @@ def main():
             pts.append(c[s])
             vals.append(u[s])
             ref.append(u_star[l2g[s]])
-        return np.vstack(pts), np.concatenate(vals), np.concatenate(ref)
+            owner.append(np.full(s.size, b, dtype=int))
+        return (np.vstack(pts), np.concatenate(vals), np.concatenate(ref),
+                np.concatenate(owner))
 
-    p_raw, v_raw, r_raw = collect("raw")
-    p_rob, v_rob, r_rob = collect("robin")
+    p_raw, v_raw, r_raw, o_raw = collect("raw")
+    p_rob, v_rob, r_rob, o_rob = collect("robin")
 
     e_raw = np.abs(v_raw - r_raw)
     e_rob = np.abs(v_rob - r_rob)
@@ -307,22 +311,82 @@ def main():
         ax.set_ylim(ax.get_ylim())
         draw_subdomain_seams(ax, a_lines, b_lines)
 
-    # The figure-wide banner is gone by request; the same numbers still go to
-    # stdout below, so nothing is lost -- it is only off the image.
-    sub = ", ".join(str(sd["ijk"]) for sd in idx_lo + idx_hi)
-    print(f"boxes on the wall: {sub}")
-    print(f"global: raw "
-          f"{np.mean([sd['u3d_partition_error_local_raw_rel_l2'] for sd in subdomains]):.3e}"
-          f"  ->  corrected {result['rel_local']:.3e}"
-          f"   (interface support {result['iface_fraction']:.1%})")
-
     out = args.out or f"interface_wall_{args.name}_{args.axis}.png"
     fig.savefig(out, dpi=160)
     print(f"wrote {out}")
-    print(f"  max |error| on the wall: raw {e_raw.max():.4e}  "
-          f"-> corrected {e_rob.max():.4e}")
-    print(f"  mean|error| on the wall: raw {e_raw.mean():.4e}  "
-          f"-> corrected {e_rob.mean():.4e}")
+
+    # ---- report -------------------------------------------------------------
+    # Everything below is report material: the error ON the cut plane and the
+    # error IN each subdomain, raw vs corrected, in one place.
+    boxes = idx_lo + idx_hi
+    raw_all = np.array([sd["u3d_partition_error_local_raw_rel_l2"]
+                        for sd in subdomains])
+    rob_all = np.array([sd["u3d_robin_rel_l2"] for sd in subdomains])
+
+    def _rel(err, refv):
+        d = float(np.linalg.norm(refv))
+        return float(np.linalg.norm(err)) / d if d > 1e-30 else float("nan")
+
+    def _gain(a, b):
+        return a / b if b > 1e-30 else float("inf")
+
+    tag = "eqs.(4)-(5)" + ("+cross" if args.cross else "")
+    bar = "=" * 78
+
+    print(f"\n{bar}\nINTERFACE ERROR  --  cut plane {args.axis} = {cut:.4f}"
+          f"   ({tag}, rho = {args.rho:g})\n{bar}")
+    print(f"points on the wall: {e_raw.size}  "
+          f"(from {len(boxes)} boxes, {len(idx_lo)} below / {len(idx_hi)} above)")
+    print(f"{'':14s}{'raw':>13s}{'corrected':>13s}{'gain':>9s}")
+    for label, a, b in (
+            ("max |e|", e_raw.max(), e_rob.max()),
+            ("mean |e|", e_raw.mean(), e_rob.mean()),
+            ("median |e|", float(np.median(e_raw)), float(np.median(e_rob))),
+            ("p95 |e|", float(np.percentile(e_raw, 95)),
+             float(np.percentile(e_rob, 95))),
+            ("L2 |e|", float(np.linalg.norm(e_raw)),
+             float(np.linalg.norm(e_rob))),
+            ("rel L2", _rel(e_raw, r_raw), _rel(e_rob, r_rob)),
+    ):
+        print(f"{label:14s}{a:13.4e}{b:13.4e}{_gain(a, b):9.2f}x")
+
+    print(f"\nper-box error ON the wall (relative L2 of the plane slice):")
+    print(f"{'box':>12s}{'pts':>7s}{'raw':>13s}{'corrected':>13s}{'gain':>9s}"
+          f"{'max raw':>12s}{'max corr':>12s}")
+    for b, sd in enumerate(boxes):
+        mr, mc = o_raw == b, o_rob == b
+        if not mr.any():
+            continue
+        rr, rc = _rel(e_raw[mr], r_raw[mr]), _rel(e_rob[mc], r_rob[mc])
+        print(f"{str(sd['ijk']):>12s}{int(mr.sum()):7d}{rr:13.4e}{rc:13.4e}"
+              f"{_gain(rr, rc):9.2f}x{e_raw[mr].max():12.4e}"
+              f"{e_rob[mc].max():12.4e}")
+
+    print(f"\n{bar}\nSUBDOMAIN ERROR  --  full volume, all {len(subdomains)} boxes"
+          f"\n{bar}")
+    print(f"{'box':>12s}{'raw':>13s}{'corrected':>13s}{'gain':>9s}"
+          f"{'on wall':>9s}")
+    on_wall = {id(sd) for sd in boxes}
+    for sd in sorted(subdomains, key=lambda s: -s["u3d_robin_rel_l2"]):
+        r0 = sd["u3d_partition_error_local_raw_rel_l2"]
+        r1 = sd["u3d_robin_rel_l2"]
+        print(f"{str(sd['ijk']):>12s}{r0:13.4e}{r1:13.4e}{_gain(r0, r1):9.2f}x"
+              f"{('yes' if id(sd) in on_wall else '-'):>9s}")
+    print(f"{'mean':>12s}{raw_all.mean():13.4e}{rob_all.mean():13.4e}"
+          f"{_gain(raw_all.mean(), rob_all.mean()):9.2f}x")
+    print(f"{'min':>12s}{raw_all.min():13.4e}{rob_all.min():13.4e}")
+    print(f"{'max':>12s}{raw_all.max():13.4e}{rob_all.max():13.4e}")
+
+    print(f"\nreconstructed global (averaged over boxes):"
+          f"  corrected {result['rel_global']:.4e}")
+    print(f"averaged local:  raw {raw_all.mean():.4e}"
+          f"  ->  corrected {result['rel_local']:.4e}")
+    print(f"interface support of the eq.(4) residual: "
+          f"{result['iface_fraction']:.1%}  (must be ~100%)")
+    if args.cross:
+        print(f"straddling nodes corrected by the cross term: "
+              f"{result.get('n_straddling_nodes', 0)}")
+    print(bar)
 
 
 if __name__ == "__main__":

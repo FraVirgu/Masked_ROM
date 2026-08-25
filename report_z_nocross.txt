@@ -1,0 +1,88 @@
+Missing HsMG for fract norm computing
+3D mesh: 384000 cells | inside domain: 201420 (52.5%)
+Q_radii: min=0.001158  max=0.008372
+1D mesh: 2840 edges | 2753 vertices
+Node radii (1D graph): r belongs [0.002534, 0.007515]
+3D DOFs: 68921 | 1D DOFs: 2753
+Dirichlet elimination: 31666 exterior dofs removed | 37255 kept (54.1%)
+Averaging over 2753 vertices:   0%|          | 0/2753 [00:00<?, ?it/s]Averaging over 2753 vertices:   8%|▊         | 220/2753 [00:00<00:01, 2192.71it/s]Averaging over 2753 vertices:  16%|█▌        | 442/2753 [00:00<00:01, 2204.10it/s]Averaging over 2753 vertices:  24%|██▍       | 663/2753 [00:00<00:00, 2173.38it/s]Averaging over 2753 vertices:  32%|███▏      | 883/2753 [00:00<00:00, 2182.08it/s]Averaging over 2753 vertices:  40%|████      | 1103/2753 [00:00<00:00, 2186.94it/s]Averaging over 2753 vertices:  48%|████▊     | 1325/2753 [00:00<00:00, 2197.54it/s]Averaging over 2753 vertices:  56%|█████▌    | 1546/2753 [00:00<00:00, 2200.47it/s]Averaging over 2753 vertices:  64%|██████▍   | 1767/2753 [00:00<00:00, 2201.38it/s]Averaging over 2753 vertices:  72%|███████▏  | 1988/2753 [00:00<00:00, 2201.81it/s]Averaging over 2753 vertices:  80%|████████  | 2209/2753 [00:01<00:00, 2202.93it/s]Averaging over 2753 vertices:  88%|████████▊ | 2430/2753 [00:01<00:00, 2202.23it/s]Averaging over 2753 vertices:  96%|█████████▋| 2651/2753 [00:01<00:00, 2198.77it/s]Averaging over 2753 vertices: 100%|██████████| 2753/2753 [00:01<00:00, 2195.81it/s]
+C: zeroed 31666 exterior columns (dropped weight 0.000e+00)
+System assembled.
+Loaded global solution from solution/Simplereport_sphere_small_n40_s1d1.0_s3d0.001_k1.0/solution.npy
+Coupling operator C: skipped 5 graph vertices (out of 624 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 3 graph vertices (out of 401 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 2 graph vertices (out of 280 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 3 graph vertices (out of 59 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 15 graph vertices (out of 359 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 7 graph vertices (out of 380 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 11 graph vertices (out of 396 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 2 graph vertices (out of 343 active) with no 3D support in this partition mesh.
+Decomposition summary:
+  subdomains: 8
+  P^Gamma nnz (= selected interface dofs, artificial cuts only): min=1261 max=1261
+  cell_counts per axis: min=(20, 20, 20) max=(20, 20, 20)
+  ||u_full_sub - u_partition_sub_raw||_2: min=2.946e-01 max=2.629e+00 avg=1.636e+00
+  relative ||u_full_sub - u_partition_sub_raw||_2 / ||u_full_sub||_2: min=2.266e-01 max=7.805e-01 avg=3.769e-01
+  partition rhs norm ||rhs||_2: min=4.455e-03 max=8.723e-02 avg=3.614e-02
+  rhs components ||b0||_2 / ||coupling||_2 (avg): 0.000e+00 / 3.614e-02
+  skipped graph vertices in C (per subdomain): min=2 max=15 avg=6.0
+  active graph vertices used for C (per subdomain): min=59 max=624 avg=355.2 zero_active=0
+  exterior dofs eliminated (per subdomain): min=3968 max=4135 avg=4093.2
+  exterior dof fraction (per subdomain): min=0.428 max=0.446 avg=0.442
+  ||u_full - u_reconstructed_raw_partitions||_2: abs=3.287e+00 rel=2.013e-01
+  reconstructed full-domain coverage: covered=68921/68921 uncovered=0 overlap_dofs=4921 max_overlap=8
+  worst subdomains by relative local error (raw):
+    (0, 1, 1): abs_err=2.494e+00 rel_err=7.805e-01 ||rhs||=4.455e-03 ||b0||=0.000e+00 ||cpl||=4.455e-03 skipped_q=3
+    (1, 0, 1): abs_err=1.075e+00 rel_err=4.367e-01 ||rhs||=1.728e-02 ||b0||=0.000e+00 ||cpl||=1.728e-02 skipped_q=7
+    (1, 0, 0): abs_err=1.235e+00 rel_err=4.237e-01 ||rhs||=1.588e-02 ||b0||=0.000e+00 ||cpl||=1.588e-02 skipped_q=15
+    (1, 1, 0): abs_err=8.370e-01 rel_err=3.978e-01 ||rhs||=1.173e-02 ||b0||=0.000e+00 ||cpl||=1.173e-02 skipped_q=11
+    (0, 0, 1): abs_err=2.629e+00 rel_err=2.739e-01 ||rhs||=8.127e-02 ||b0||=0.000e+00 ||cpl||=8.127e-02 skipped_q=3
+cut plane: z = 0.000000  (tol 6.25e-02)
+boxes touching it: 4 below, 4 above
+global dofs on the plane: 1681
+subdomain seams on the plane: 1 + 1
+wrote interface_wall_git_sphere_small_z_nocross.png
+
+==============================================================================
+INTERFACE ERROR  --  cut plane z = 0.0000   (eqs.(4)-(5), rho = 1)
+==============================================================================
+points on the wall: 2832  (from 8 boxes, 4 below / 4 above)
+                        raw    corrected     gain
+max |e|          9.0013e-01   9.9949e-01     0.90x
+mean |e|         2.3654e-02   2.7196e-02     0.87x
+median |e|       6.6702e-03   4.3730e-04    15.25x
+p95 |e|          9.5929e-02   1.5029e-01     0.64x
+L2 |e|           2.8157e+00   4.9699e+00     0.57x
+rel L2           4.0042e-01   7.0677e-01     0.57x
+
+per-box error ON the wall (relative L2 of the plane slice):
+         box    pts          raw    corrected     gain     max raw    max corr
+   (0, 0, 0)    351   3.3324e-01   4.4378e-01     0.75x  6.1826e-01  5.7277e-01
+   (0, 1, 0)    352   3.3545e-01   1.2733e+00     0.26x  1.4759e-01  9.8874e-01
+   (1, 0, 0)    352   3.5436e-01   1.4577e+00     0.24x  9.9466e-02  9.9016e-01
+   (1, 1, 0)    361   1.6078e-01   1.8215e+00     0.09x  5.3506e-02  9.7198e-01
+   (0, 0, 1)    361   4.1617e-01   4.8797e-01     0.85x  9.0013e-01  9.6091e-01
+   (0, 1, 1)    352   7.5867e-01   1.2740e+00     0.60x  2.8592e-01  9.2667e-01
+   (1, 0, 1)    352   3.6967e-01   1.4454e+00     0.26x  1.0593e-01  9.9949e-01
+   (1, 1, 1)    351   1.8057e-01   1.3317e+00     0.14x  3.8619e-02  3.6729e-01
+
+==============================================================================
+SUBDOMAIN ERROR  --  full volume, all 8 boxes
+==============================================================================
+         box          raw    corrected     gain  on wall
+   (1, 1, 1)   2.2656e-01   9.1638e-01     0.25x      yes
+   (1, 1, 0)   3.9781e-01   7.7057e-01     0.52x      yes
+   (1, 0, 1)   4.3672e-01   7.2866e-01     0.60x      yes
+   (1, 0, 0)   4.2366e-01   6.9834e-01     0.61x      yes
+   (0, 1, 1)   7.8052e-01   6.9241e-01     1.13x      yes
+   (0, 1, 0)   2.4840e-01   3.0840e-01     0.81x      yes
+   (0, 0, 1)   2.7387e-01   2.5119e-01     1.09x      yes
+   (0, 0, 0)   2.2733e-01   2.1323e-01     1.07x      yes
+        mean   3.7686e-01   5.7240e-01     0.66x
+         min   2.2656e-01   2.1323e-01
+         max   7.8052e-01   9.1638e-01
+
+reconstructed global (averaged over boxes):  corrected 1.8854e-01
+averaged local:  raw 3.7686e-01  ->  corrected 5.7240e-01
+interface support of the eq.(4) residual: 100.0%  (must be ~100%)
+==============================================================================

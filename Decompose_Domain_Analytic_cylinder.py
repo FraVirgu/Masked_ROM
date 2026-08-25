@@ -238,7 +238,6 @@ if __name__ == "__main__":
         n_vasi          = args.inlet,
         n_ramifications = args.outlet,
         boundary        = boundary,
-        n_min = n_min, n_max = n_max
     ).build()
 
     domain.export_box()

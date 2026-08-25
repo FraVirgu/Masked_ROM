@@ -861,9 +861,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("-name",   type=str, required=True,
                         help="subfolder name inside nets/ (e.g. sphere01)")
-    parser.add_argument("-inlet",  type=int, default=15,
+    parser.add_argument("-inlet",  type=int, default=10,
                         help="number of inflow vessels (n_vasi)")
-    parser.add_argument("-outlet", type=int, default=15,
+    parser.add_argument("-outlet", type=int, default=10,
                         help="ramifications per vessel (n_ramifications)")
     parser.add_argument("-n",      type=int, default=40,
                         help="3D background mesh resolution")
@@ -873,7 +873,7 @@ if __name__ == "__main__":
                         help="3D conductivity (sigma3d)")
     parser.add_argument("-kappa", type=float, default=1.0,
                         help="coupling coefficient (kappa)")
-    parser.add_argument("-radius", type=float, default=1.0,
+    parser.add_argument("-radius", type=float, default=5.0,
                         help="radius of the spherical boundary")
     args = parser.parse_args()
 
@@ -922,7 +922,10 @@ if __name__ == "__main__":
         n_vasi          = args.inlet,
         n_ramifications = args.outlet,
         boundary        = boundary,
-        n_min = -args.radius, n_max = args.radius
+        radius_mean = 0.005, 
+        radius_std = 0.001,
+        radius_min = 0.001,
+        radius_max = 0.01,
     ).build()
 
     domain.export_box()
