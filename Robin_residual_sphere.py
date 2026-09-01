@@ -8,7 +8,10 @@ restriction of the known global solution u* to box i:
 
 Local solve, with the data arriving from the face-neighbours:
 
-    ( A_i + rho G_i^Gamma ) u_i = b_i + sum_{j in N(i)} E_ij f_j^{*,-}   (5)
+    ( A_i + rho G_i^Gamma ) u_i = b_i + sum_{j != i} E_ij f_j^{*,-}      (5)
+
+with E_ij the mass-reweighted transfer m_i * (. / m_j), NOT a plain index
+copy -- see the gather in apply_robin_residual for why.
 
 That is all this file does. Diagnostics, exactness checks and the alternative
 transmission schemes live elsewhere; `Decompose_Domain_Analytic.decomposeDomain`
@@ -43,9 +46,10 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import spsolve
 
-from dolfin import Function
+from dolfin import Function, Measure, TestFunction, assemble
 
 from Decompose_Domain_Analytic_sphere import (
+    ARTIFICIAL_FACET_TAG,
     mark_artificial_facets,
     assemble_robin_interface,
 )
@@ -93,8 +97,28 @@ def _interface_selector(subdomain, ps, l2g):
     return sel
 
 
+def _interface_mass(ps, facet_markers):
+    """m_i = int_{Gamma_i^art} phi_k ds, the local test-function mass on Gamma.
+
+    This is the row-sum weight that makes f_i^{*,-} a LOAD rather than a
+    pointwise value: eq. (4) produces b_i - A_i u + rho G u, every term of
+    which is an integral against box i's test functions. Handing that vector
+    to a neighbour unchanged therefore imports box i's surface measure along
+    with it. See _gather_incoming for what has to be done about that.
+    """
+    v = TestFunction(ps.V)
+    ds_art = Measure("ds", domain=ps.meshV, subdomain_data=facet_markers)
+    return assemble(v * ds_art(ARTIFICIAL_FACET_TAG)).get_local()
+
+
 def _face_neighbours(subdomains):
     """Index pairs of boxes sharing a FACE.
+
+    NO LONGER USED BY THE GATHER. Kept because the diagnostics and
+    test_professor_vs_mine.py import it, and because it documents the
+    face-adjacency rule the gather deliberately abandoned: boxes touching only
+    along an edge do share interface dofs, and skipping them cost accuracy
+    (8.41e-02 -> 5.94e-02 once all j are included).
 
     Not a dof-set intersection: on a structured grid the internal cut planes
     span the whole cross-section, so every pair of boxes touches somewhere
@@ -234,8 +258,10 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
 
         G_gamma, n_tagged = _robin_interface(ps, g_min, g_max)
         sel = _interface_selector(sd, ps, l2g)
+        facet_markers, _ = mark_artificial_facets(ps, g_min, g_max)
         sd["_G_gamma"] = G_gamma
         sd["_sel"] = sel
+        sd["_mass"] = _interface_mass(ps, facet_markers)
         sd["_n_artificial_facets"] = n_tagged
 
         u_i = src[l2g]
@@ -281,23 +307,76 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
         f_star[l2g] = np.where(sel, r_i, 0.0)
         sd["f_star_minus"] = f_star
 
-    # ---- E_ij: gather the face-neighbours' data on the shared face ----------
-    # The grid is structured and local_to_global_dof is exact, so E_ij is a
-    # plain index transfer -- no reorientation. Eq. (5) is a plain sum over
-    # j in N(i): a dof on an edge shared by two face-neighbours genuinely
-    # belongs to two pieces of Gamma^art_i, so it is not averaged.
-    nbrs = _face_neighbours(subdomains)
+    # ---- E_ij: gather the neighbours' data on the shared interface ----------
+    # Two things here are NOT what a naive reading of eq. (5) suggests, and
+    # both are needed; either one alone makes the result worse.
+    #
+    # (1) WHICH dofs receive. The target set is the CONNECTIVITY set
+    #     {d : mu(d) == 2}, i.e. dofs owned by exactly two boxes -- not the
+    #     intersection of the two boxes' P^Gamma selectors. Those differ
+    #     enormously: box0 <- box1 writes 351 dofs under the selector rule but
+    #     4800 under the connectivity rule, and 4490 of the latter are dofs the
+    #     selector rule never reaches. _interface_selector strips every
+    #     eliminated exterior dof, and with ~44% of dofs eliminated per box the
+    #     sel-intersection is a small fraction of the true shared surface.
+    #     Using it silently drops most of the interface from the exchange.
+    #
+    #     Measured, all j, masked eta:  target=sel 3.84e-01, target=mu 1.86e-01.
+    #
+    # (2) The mu > 2 dofs -- box edges and corners -- get a DIFFERENT rule.
+    #     There f_j is a load carrying box j's surface measure, and more than
+    #     two boxes contribute, so the raw sum both over-counts and arrives in
+    #     the wrong weighting. Passing a density and re-weighting on arrival,
+    #
+    #         m_i * (f_j / m_j) * penalty,     penalty = 1/(mu - 1)
+    #
+    #     is professor_ROM_method.py:1711-1718. On its own this is worth
+    #     little; combined with (1) it is what takes 1.86e-01 to 5.94e-02.
+    #
+    # The full 2x2:            cross_rule=off   cross_rule=on
+    #     target = sel           3.84e-01         5.49e-01
+    #     target = mu            1.86e-01         5.94e-02   <- both needed
+    #
+    # The P^Gamma masking of the SENT vector is kept. Dropping it (as he does)
+    # needs his 111/222 facet tagging to keep interior residual out of the
+    # transfer; with our Dirichlet elimination the unmasked residual is not
+    # interface data and sending it is actively harmful (4.22e-01, twice the
+    # uncoupled error).
+    mu_mult = np.zeros(n_global, dtype=float)
+    for sd in subdomains:
+        mu_mult[sd["local_to_global_dof"]] += 1.0
+    mask_face = (mu_mult == 2.0)
+    mask_cross = (mu_mult > 2.0)
+    penalty = np.zeros(n_global, dtype=float)
+    penalty[mask_cross] = 1.0 / np.maximum(mu_mult[mask_cross] - 1.0, 1.0)
+
+    mass_g = []
+    for sd in subdomains:
+        m = np.zeros(n_global, dtype=float)
+        m[sd["local_to_global_dof"]] = sd["_mass"]
+        mass_g.append(m)
+
     for i, sd in enumerate(subdomains):
         l2g_i = sd["local_to_global_dof"]
-        iface_i = np.zeros(n_global, dtype=bool)
-        iface_i[l2g_i[sd["_sel"]]] = True
-
         incoming = np.zeros(n_global, dtype=float)
-        for j in nbrs[i]:
-            owned_j = np.zeros(n_global, dtype=bool)
-            owned_j[subdomains[j]["local_to_global_dof"]] = True
-            shared = iface_i & owned_j
-            incoming[shared] += subdomains[j]["f_star_minus"][shared]
+
+        for j, sd_j in enumerate(subdomains):
+            if j == i:
+                continue
+            f_j = subdomains[j]["f_star_minus"]
+
+            # plain faces: straight transfer on the connectivity set
+            incoming[mask_face] += f_j[mask_face]
+
+            # edges/corners: density in, box i's weighting out, share of the
+            # (mu - 1) contributing neighbours
+            ok = mask_cross & (mass_g[j] > 1e-30)
+            dens = np.zeros(n_global, dtype=float)
+            dens[ok] = f_j[ok] / mass_g[j][ok]
+            incoming[mask_cross] += (mass_g[i][mask_cross]
+                                     * dens[mask_cross]
+                                     * penalty[mask_cross])
+
         sd["_f_incoming"] = incoming
 
     # ---- eq. (5): local Robin solve ----------------------------------------

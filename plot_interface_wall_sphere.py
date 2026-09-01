@@ -146,7 +146,8 @@ def main():
     ap.add_argument("-restrict_global_C", action="store_true")
     ap.add_argument("-cross", action="store_true")
     ap.add_argument("-out", type=str, default=None,
-                    help="output png; defaults to interface_wall_{name}.png")
+                    help="output png; defaults to "
+                         "interface_wall_{name}_{axis}[_cross].png")
     ap.add_argument("-solution", type=str, default=None)
     args = ap.parse_args()
 
@@ -295,10 +296,20 @@ def main():
     fig.colorbar(s0, ax=axes[0], shrink=0.85, label="pressure")
 
     lbl = "eqs. (4)-(5)" + (" + cross" if args.cross else "")
+    # Each error panel also reports the RECONSTRUCTED GLOBAL error of the field
+    # it comes from. The panel itself only shows the cut plane, so without this
+    # the reader cannot tell whether a visually better wall corresponds to a
+    # better solution overall -- the two need not move together.
+    rel_glob_raw = float(subdomains[0]["u3d_partition_full_error_raw_rel_l2"])
+    rel_glob_rob = float(result["rel_global"])
     surface_plane(axes[1], p_raw, e_raw, ax_i, enorm, ecmap,
-                  f"raw error  $|u_i-u^*|$\nmax {e_raw.max():.2e}")
+                  f"raw error  $|u_i-u^*|$\n"
+                  f"max {e_raw.max():.2e}   "
+                  f"global rel $L^2$ {rel_glob_raw:.3e}")
     s2 = surface_plane(axes[2], p_rob, e_rob, ax_i, enorm, ecmap,
-                       f"{lbl} error  $|u_i-u^*|$\nmax {e_rob.max():.2e}")
+                       f"{lbl} error  $|u_i-u^*|$\n"
+                       f"max {e_rob.max():.2e}   "
+                       f"global rel $L^2$ {rel_glob_rob:.3e}")
     # The two error panels share `enorm`, so their colours are comparable.
     fig.colorbar(s2, ax=axes[1:], shrink=0.85, label="|error|")
 
@@ -311,7 +322,11 @@ def main():
         ax.set_ylim(ax.get_ylim())
         draw_subdomain_seams(ax, a_lines, b_lines)
 
-    out = args.out or f"interface_wall_{args.name}_{args.axis}.png"
+    # -cross changes the method, not just a display option, so it belongs in
+    # the filename: without it a cross and a no-cross run of the same name and
+    # axis overwrite each other and the two are indistinguishable afterwards.
+    suffix = "_cross" if args.cross else ""
+    out = args.out or f"interface_wall_{args.name}_{args.axis}{suffix}.png"
     fig.savefig(out, dpi=160)
     print(f"wrote {out}")
 

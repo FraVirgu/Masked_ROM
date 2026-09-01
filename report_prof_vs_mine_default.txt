@@ -1,0 +1,164 @@
+Missing HsMG for fract norm computing
+3D mesh: 384000 cells | inside domain: 201420 (52.5%)
+Q_radii: min=0.001158  max=0.008372
+1D mesh: 2840 edges | 2753 vertices
+Node radii (1D graph): r belongs [0.002534, 0.007515]
+3D DOFs: 68921 | 1D DOFs: 2753
+Dirichlet elimination: 31666 exterior dofs removed | 37255 kept (54.1%)
+C: zeroed 31666 exterior columns (dropped weight 0.000e+00)
+System assembled.
+Loaded global solution (68921 3D dofs, 2753 1D dofs)
+Coupling operator C: skipped 5 graph vertices (out of 624 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 3 graph vertices (out of 401 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 2 graph vertices (out of 280 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 3 graph vertices (out of 59 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 15 graph vertices (out of 359 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 7 graph vertices (out of 380 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 11 graph vertices (out of 396 active) with no 3D support in this partition mesh.
+Coupling operator C: skipped 2 graph vertices (out of 343 active) with no 3D support in this partition mesh.
+Decomposition summary:
+  subdomains: 8
+  P^Gamma nnz (= selected interface dofs, artificial cuts only): min=1261 max=1261
+  cell_counts per axis: min=(20, 20, 20) max=(20, 20, 20)
+  ||u_full_sub - u_partition_sub_raw||_2: min=2.946e-01 max=2.629e+00 avg=1.636e+00
+  relative ||u_full_sub - u_partition_sub_raw||_2 / ||u_full_sub||_2: min=2.266e-01 max=7.805e-01 avg=3.769e-01
+  partition rhs norm ||rhs||_2: min=4.455e-03 max=8.723e-02 avg=3.614e-02
+  rhs components ||b0||_2 / ||coupling||_2 (avg): 0.000e+00 / 3.614e-02
+  skipped graph vertices in C (per subdomain): min=2 max=15 avg=6.0
+  active graph vertices used for C (per subdomain): min=59 max=624 avg=355.2 zero_active=0
+  exterior dofs eliminated (per subdomain): min=3968 max=4135 avg=4093.2
+  exterior dof fraction (per subdomain): min=0.428 max=0.446 avg=0.442
+  ||u_full - u_reconstructed_raw_partitions||_2: abs=3.287e+00 rel=2.013e-01
+  reconstructed full-domain coverage: covered=68921/68921 uncovered=0 overlap_dofs=4921 max_overlap=8
+  worst subdomains by relative local error (raw):
+    (0, 1, 1): abs_err=2.494e+00 rel_err=7.805e-01 ||rhs||=4.455e-03 ||b0||=0.000e+00 ||cpl||=4.455e-03 skipped_q=3
+    (1, 0, 1): abs_err=1.075e+00 rel_err=4.367e-01 ||rhs||=1.728e-02 ||b0||=0.000e+00 ||cpl||=1.728e-02 skipped_q=7
+    (1, 0, 0): abs_err=1.235e+00 rel_err=4.237e-01 ||rhs||=1.588e-02 ||b0||=0.000e+00 ||cpl||=1.588e-02 skipped_q=15
+    (1, 1, 0): abs_err=8.370e-01 rel_err=3.978e-01 ||rhs||=1.173e-02 ||b0||=0.000e+00 ||cpl||=1.173e-02 skipped_q=11
+    (0, 0, 1): abs_err=2.629e+00 rel_err=2.739e-01 ||rhs||=8.127e-02 ||b0||=0.000e+00 ||cpl||=8.127e-02 skipped_q=3
+
+==============================================================================
+0. SETUP
+==============================================================================
+  subdomains          : 8
+  global 3D dofs      : 68921
+  LAMBDA (= our rho)  : 1
+  K1     (= sigma3d)  : 0.001
+  BETA                : 0
+  our C_i built by    : local clipped quadrature (renormalized)
+  mu_mult histogram   : 1->64000, 2->4800, 4->120, 8->1
+     mu==1 interior, mu==2 face, mu>2 edge/corner (his mask_cross)
+
+==============================================================================
+1. COUPLING OPERATOR  C_i    (ours vs his xii Average)
+==============================================================================
+  Compared FUNCTIONALLY: both operators applied to the same u*,
+  averages matched at coincident physical points (his operator
+  lives on a DG space with a different dof ordering).
+  his divides by the FULL circle and drops outside points;
+  ours (default path) divides by the SURVIVING arc.
+  ijk             rel diff  straddl           ours rowsum          his rowsum
+                                           min       mean       min      mean
+  (0, 0, 0)      5.399e-02        0     1.0000     1.0000    0.1346    0.9942
+  (0, 0, 1)      7.592e-02        0     1.0000     1.0000    0.2442    0.9879
+  (0, 1, 0)      1.156e-01        0     1.0000     1.0000    0.1843    0.9796
+  (0, 1, 1)      8.945e-02        0     1.0000     1.0000    0.2161    0.9735
+  (1, 0, 0)      4.005e-02        0     1.0000     1.0000    0.2824    0.9954
+  (1, 0, 1)      7.535e-02        0     1.0000     1.0000    0.1095    0.9890
+  (1, 1, 0)      1.836e-01        0     1.0000     1.0000    0.0667    0.9649
+  (1, 1, 1)      1.227e-01        0     1.0000     1.0000    0.2824    0.9808
+
+  READ THIS COLUMN FIRST: row sum 1.0 = a genuine average.
+  Whichever side shows row sums < 1 is losing circle weight
+  outright instead of averaging over the part it still owns.
+
+==============================================================================
+2. 1D MASS MATRIX  G
+==============================================================================
+  ours: assemble(kappa*2*pi*R * p*q * dx) on the shared global meshQ
+  his : J = 2*pi*L_cap*rho_int*R inside m[0][0] = J*inner(Ru,Rv)*dx_
+  Same form up to the constant; his J carries extra physical
+  factors (L_cap, rho_int) that our kappa absorbs. Reported as a
+  scalar ratio, since a mismatch here rescales the whole coupling.
+  ||G_ours||_F = 3.181458e-01
+  G is shared by every box (same meshQ)  : True
+
+==============================================================================
+3. LOCAL OPERATOR  A_i
+==============================================================================
+  stiff : our sigma3d*grad.grad*dx(222) vs his K1*grad.grad*dx(222)
+          -> the block both sides share; must be ~0
+  +mass : ||our extra sigma3d*u*v|| / ||stiffness||. He has NO such
+          term. This is a MODELLING difference (Helmholtz vs Poisson),
+          not a bug, but it changes what eq. (5) inverts.
+  robin : our rho*G_gamma vs his LAMBDA*inner(u,v)*ds(222)
+  total : A_i as eq. (5) inverts it
+  ijk                stiff     +mass       robin       total  verdict(stiff)
+  (0, 0, 0)      0.000e+00      0.00   4.195e-01   5.320e+01  IDENTICAL
+  (0, 0, 1)      0.000e+00      0.00   4.087e-01   5.440e+01  IDENTICAL
+  (0, 1, 0)      0.000e+00      0.00   4.087e-01   5.446e+01  IDENTICAL
+  (0, 1, 1)      0.000e+00      0.00   4.087e-01   5.453e+01  IDENTICAL
+  (1, 0, 0)      0.000e+00      0.00   4.087e-01   5.438e+01  IDENTICAL
+  (1, 0, 1)      0.000e+00      0.00   4.087e-01   5.417e+01  IDENTICAL
+  (1, 1, 0)      0.000e+00      0.00   4.087e-01   5.439e+01  IDENTICAL
+  (1, 1, 1)      0.000e+00      0.00   4.195e-01   5.327e+01  IDENTICAL
+
+==============================================================================
+4. ROBIN FLUX  eta_i
+==============================================================================
+  his : eta = b - (A00+M00+Rphy)u + Rgamma*u,  NO P^Gamma applied
+  ours: r   = b - A u + rho*G_gamma*u,  then masked by sel
+  'iface frac' = ||eta on Gamma|| / ||eta||. Eq. (4) discards
+  everything off Gamma, so this must be ~1 for the extraction to
+  mean anything. He never needs it -- his gather does the masking.
+  ijk             rel diff   iface his  iface ours
+  (0, 0, 0)      7.475e-01      100.0%      100.0%
+  (0, 0, 1)      2.030e-01      100.0%      100.0%
+  (0, 1, 0)      1.226e-01      100.0%      100.0%
+  (0, 1, 1)      5.169e-02      100.0%      100.0%
+  (1, 0, 0)      1.585e-01      100.0%      100.0%
+  (1, 0, 1)      5.271e-02      100.0%      100.0%
+  (1, 1, 0)      5.171e-02      100.0%      100.0%
+  (1, 1, 1)      1.921e-01      100.0%      100.0%
+
+==============================================================================
+5. INTERFACE GATHER  E_ij
+==============================================================================
+  face dofs   (mu==2) : 4800
+  cross dofs  (mu >2) : 121   <- his mask_cross
+  OLD wrote only where sel_i & sel_j -- the exterior-dof
+  elimination shrinks that to a fraction of the shared surface
+  (351 of 4800 dofs for box0<-box1). NEW targets the connectivity
+  set mu==2 like he does, and uses the density rule
+  m_i*(f_j/m_j)*penalty on the mu>2 edge/corner dofs.
+  ijk           old vs his  new vs his      ||his||      ||old||      ||new||
+  (0, 0, 0)      2.410e-01   1.396e-02   3.5596e-01   3.8422e-01   3.5589e-01
+  (0, 0, 1)      2.669e-01   2.970e-02   3.0631e-01   3.3526e-01   3.0605e-01
+  (0, 1, 0)      3.263e-01   3.583e-02   2.3547e-01   2.6862e-01   2.3520e-01
+  (0, 1, 1)      4.639e-01   1.172e-02   1.4957e-01   1.9081e-01   1.4953e-01
+  (1, 0, 0)      4.729e-01   2.254e-02   1.3478e-01   1.7264e-01   1.3471e-01
+  (1, 0, 1)      4.899e-01   1.663e-02   1.1497e-01   1.4904e-01   1.1492e-01
+  (1, 1, 0)      5.137e-01   1.017e-02   9.9110e-02   1.3081e-01   9.9090e-02
+  (1, 1, 1)      5.527e-01   3.345e-03   6.6176e-02   9.2586e-02   6.6168e-02
+
+==============================================================================
+6. LOCAL SOLVE AND GLOBAL ERROR
+==============================================================================
+  ijk                  raw  his gather    ours OLD    ours NEW
+  (0, 0, 0)      2.273e-01   6.385e-02   2.132e-01   6.384e-02
+  (0, 0, 1)      2.739e-01   6.424e-02   2.512e-01   7.176e-02
+  (0, 1, 0)      2.484e-01   3.284e-02   3.084e-01   4.738e-02
+  (0, 1, 1)      7.805e-01   4.558e-02   6.924e-01   5.215e-02
+  (1, 0, 0)      4.237e-01   6.753e-02   6.983e-01   7.682e-02
+  (1, 0, 1)      4.367e-01   3.463e-02   7.287e-01   5.336e-02
+  (1, 1, 0)      3.978e-01   3.693e-02   7.706e-01   4.303e-02
+  (1, 1, 1)      2.266e-01   1.015e-01   9.164e-01   1.016e-01
+
+  reconstructed global relative L2 error
+    raw (no coupling) : 2.012981e-01
+    his gather        : 5.587349e-02
+    ours OLD          : 1.885363e-01
+    ours NEW (fixed)  : 5.938033e-02
+
+  All three invert the SAME A_i, so every gap is caused purely by
+  the interface gather.
