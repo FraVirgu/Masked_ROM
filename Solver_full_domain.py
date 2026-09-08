@@ -133,6 +133,7 @@ class Solver3D1D:
         beta_nitsche: float = 1.0,
         inlet_tag: int = 111,
         exterior: str = "dirichlet",
+        lenght_sub_domain = None
     ):
         if exterior != "dirichlet":
             raise ValueError(

@@ -1,24 +1,42 @@
-"""Plot the field on an artificial cut plane of a CYLINDRICAL domain.
+"""Plot an artificial cut plane of a CYLINDRICAL domain -- Schwarz variant.
 
-Companion to plot_interface_wall_sphere.py. The drawing itself does not care
-what shape the domain is -- plane_dofs, surface_plane, subdomain_seams and
-draw_subdomain_seams all work off scattered dof coordinates -- so those are
-IMPORTED from the sphere script and only `main` is rewritten, to build a
-CylinderBoundary and to size the mesh spacing from the cylinder's own extents.
+Sits at the intersection of two existing scripts:
+
+    plot_interface_wall_cylinder.py         cylinder geometry, Robin residual
+    plot_interface_wall_sphere_schwarz.py   sphere geometry,   Schwarz iteration
+    this file                               cylinder geometry, Schwarz iteration
+
+so it takes the cylinder setup from the first and the transmission scheme from
+the second. As in plot_interface_wall_cylinder.py the drawing helpers are
+geometry-agnostic -- they work off scattered dof coordinates -- and are
+IMPORTED from the sphere script rather than duplicated; only `main` is written
+here, to build a CylinderBoundary, size the mesh from the cylinder's extents,
+and drive solve_schwarz_robin.
+
+The distinction from the residual method matters for what the picture means.
+apply_robin_residual evaluates eq. (4) at the ground-truth u*, so its corrected
+wall is informed by the answer. The Schwarz iteration never touches u* -- each
+sweep feeds a box the neighbours' PREVIOUS traces -- so the wall shown here is
+reachable without knowing the target. A residual panel that looks better is
+therefore not automatically the better scheme.
 
 Three panels, the two error ones on a shared colour scale:
 
     global      u* restricted to the plane -- the target
     raw         the boxes touching the plane, solved in isolation
-    robin       the same boxes after eqs. (4)-(5)
+    schwarz     the same boxes after the converged Schwarz iteration
 
 Red dashed lines mark the seams between subdomains on the plane.
 
+There is no -cross here: the cross term corrects the eq. (4) extraction, and
+the Schwarz scheme forms no such residual. The knobs that replace it are -rho,
+-max_iter and -tol.
+
 Run (reuses the saved global solution):
 
-    python plot_interface_wall_cylinder.py -name cylinder_dd
-    python plot_interface_wall_cylinder.py -name cylinder_dd -cross
-    python plot_interface_wall_cylinder.py -name cylinder_dd -axis z -out wall.png
+    python plot_interface_wall_cylinder_schwarz.py -name cylinder_dd
+    python plot_interface_wall_cylinder_schwarz.py -name cylinder_dd -rho 2.9e-2
+    python plot_interface_wall_cylinder_schwarz.py -name cylinder_dd -axis z -out wall.png
 """
 
 import argparse
@@ -42,7 +60,7 @@ from Decompose_Domain_Analytic_cylinder import (
 )
 from Solver_full_domain import Solver3D1D
 from Boundary import CylinderBoundary, random_cylinder_points
-from Robin_residual_sphere import apply_robin_residual
+from Solve_schwarz_robin import solve_schwarz_robin
 
 # Geometry-agnostic drawing helpers, reused verbatim.
 from plot_interface_wall_sphere import (
@@ -70,14 +88,23 @@ def main():
                     help="direction of the cylinder axis (the geometry)")
     ap.add_argument("-parts", type=int, default=2,
                     help="subdomains per direction")
-    ap.add_argument("-rho", type=float, default=1.0)
+    # Schwarz knobs. Unlike the residual script, whose -rho defaults to 1.0,
+    # rho defaults to None so solve_schwarz_robin applies its own sigma3d/hmax
+    # heuristic -- the two rho's scale the same G_gamma but the schemes put it
+    # to different use, so the residual default does not carry over.
+    ap.add_argument("-rho", type=float, default=None,
+                    help="Robin penalty; default sigma3d/hmax. "
+                         "Measured optimum on the sphere problem: ~2.9e-2")
+    ap.add_argument("-max_iter", type=int, default=60,
+                    help="maximum Schwarz sweeps")
+    ap.add_argument("-tol", type=float, default=1e-8,
+                    help="stop when the largest iterate change falls below this")
     ap.add_argument("-axis", choices=("x", "y", "z"), default="y",
                     help="normal of the cut plane to draw (the view)")
     ap.add_argument("-restrict_global_C", action="store_true")
-    ap.add_argument("-cross", action="store_true")
     ap.add_argument("-out", type=str, default=None,
                     help="output png; defaults to "
-                         "interface_wall_{name}_{axis}.png")
+                         "interface_wall_schwarz_{name}_{axis}.png")
     ap.add_argument("-solution", type=str, default=None)
     args = ap.parse_args()
 
@@ -142,14 +169,21 @@ def main():
     subdomains = decomposeDomain(
         solver, boundary,
         x_ROM_lenght=lx, y_ROM_lenght=ly, z_ROM_lenght=lz,
-        restrict_global_C=args.restrict_global_C or args.cross)
+        restrict_global_C=args.restrict_global_C)
 
-    # Raw local fields must be captured BEFORE apply_robin_residual.
+    # Raw local fields must be captured BEFORE solve_schwarz_robin, which
+    # stores its iterate under its own key alongside them.
     for sd in subdomains:
         sd["_u_raw"] = sd["partition_solver"].u3d.vector().get_local().copy()
 
-    result = apply_robin_residual(
-        subdomains, solver, rho_robin=args.rho, cross=args.cross)
+    history = solve_schwarz_robin(
+        subdomains, solver, rho_robin=args.rho,
+        max_iter=args.max_iter, tol=args.tol, print_summary=True)
+    # solve_schwarz_robin reports but does not return the converged errors, so
+    # read them off the last sweep of the history it hands back.
+    n_sweeps, delta_final, rel_local_final, rel_global_final = history[-1]
+    rho_used = (args.rho if args.rho is not None
+                else float(solver.sigma3d) / max(float(solver.meshV.hmax()), 1e-30))
 
     # ---- locate the cut plane ----------------------------------------------
     V = solver.W[0]
@@ -198,7 +232,7 @@ def main():
             l2g = sd["local_to_global_dof"]
             c = ps.V.tabulate_dof_coordinates().reshape((ps.V.dim(), -1))
             u = (sd["_u_raw"] if field_key == "raw"
-                 else sd["u3d_robin"].vector().get_local())
+                 else sd["u3d_partition_schwarz"].vector().get_local())
             s = plane_dofs(c, ax_i, cut, tol)
             ext = getattr(ps, "ext_dofs", None)
             if ext is not None and np.size(ext):
@@ -211,13 +245,13 @@ def main():
         return np.vstack(pts), np.concatenate(vals), np.concatenate(ref)
 
     p_raw, v_raw, r_raw = collect("raw")
-    p_rob, v_rob, r_rob = collect("robin")
+    p_sch, v_sch, r_sch = collect("schwarz")
 
     e_raw = np.abs(v_raw - r_raw)
-    e_rob = np.abs(v_rob - r_rob)
+    e_sch = np.abs(v_sch - r_sch)
 
     enorm = Normalize(vmin=0.0,
-                      vmax=float(max(e_raw.max(), e_rob.max(), 1e-30)))
+                      vmax=float(max(e_raw.max(), e_sch.max(), 1e-30)))
 
     # ---- draw ---------------------------------------------------------------
     fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), constrained_layout=True)
@@ -226,21 +260,20 @@ def main():
                        f"global $u^*$  on {args.axis} = {cut:.2f}")
     fig.colorbar(s0, ax=axes[0], shrink=0.85, label="pressure")
 
-    lbl = "eqs. (4)-(5)" + (" + cross" if args.cross else "")
+    lbl = f"Schwarz/Robin ({n_sweeps} sweeps)"
     # Each error panel also reports the RECONSTRUCTED GLOBAL error of the field
     # it comes from. The panel itself only shows the cut plane, so without this
     # the reader cannot tell whether a visually better wall corresponds to a
     # better solution overall -- the two need not move together.
     rel_glob_raw = float(subdomains[0]["u3d_partition_full_error_raw_rel_l2"])
-    rel_glob_rob = float(result["rel_global"])
     surface_plane(axes[1], p_raw, e_raw, ax_i, enorm, ecmap,
                   f"raw error  $|u_i-u^*|$\n"
                   f"max {e_raw.max():.2e}   "
                   f"global rel $L^2$ {rel_glob_raw:.3e}")
-    s2 = surface_plane(axes[2], p_rob, e_rob, ax_i, enorm, ecmap,
+    s2 = surface_plane(axes[2], p_sch, e_sch, ax_i, enorm, ecmap,
                        f"{lbl} error  $|u_i-u^*|$\n"
-                       f"max {e_rob.max():.2e}   "
-                       f"global rel $L^2$ {rel_glob_rob:.3e}")
+                       f"max {e_sch.max():.2e}   "
+                       f"global rel $L^2$ {rel_global_final:.3e}")
     fig.colorbar(s2, ax=axes[1:], shrink=0.85, label="|error|")
 
     a_lines, b_lines = subdomain_seams(idx_lo + idx_hi, ax_i)
@@ -253,21 +286,31 @@ def main():
         draw_subdomain_seams(ax, a_lines, b_lines)
 
     sub = ", ".join(str(sd["ijk"]) for sd in idx_lo + idx_hi)
+    raw_local = float(np.mean(
+        [sd["u3d_partition_error_local_raw_rel_l2"] for sd in subdomains]))
     print(f"domain: cylinder r={args.radius} h={args.height} "
           f"axis={args.cyl_axis}")
     print(f"boxes on the wall: {sub}")
-    print(f"global: raw "
-          f"{np.mean([sd['u3d_partition_error_local_raw_rel_l2'] for sd in subdomains]):.3e}"
-          f"  ->  corrected {result['rel_local']:.3e}"
-          f"   (interface support {result['iface_fraction']:.1%})")
+    # Local and global are reported on separate lines and named for what they
+    # are: they are different measures and need not move by the same factor.
+    print(f"averaged local:  raw {raw_local:.3e}"
+          f"  ->  corrected {rel_local_final:.3e}")
+    print(f"reconstructed global:  raw {rel_glob_raw:.3e}"
+          f"  ->  corrected {rel_global_final:.3e}")
 
-    out = args.out or f"interface_wall_{args.name}_{args.axis}.png"
+    out = args.out or f"interface_wall_schwarz_{args.name}_{args.axis}.png"
     fig.savefig(out, dpi=160)
     print(f"wrote {out}")
     print(f"  max |error| on the wall: raw {e_raw.max():.4e}  "
-          f"-> corrected {e_rob.max():.4e}")
+          f"-> corrected {e_sch.max():.4e}")
     print(f"  mean|error| on the wall: raw {e_raw.mean():.4e}  "
-          f"-> corrected {e_rob.mean():.4e}")
+          f"-> corrected {e_sch.mean():.4e}")
+    # The convergence state has no analogue in the one-shot residual method and
+    # is the thing to check when the corrected wall disappoints: a run that
+    # stopped on max_iter rather than tol has not converged.
+    print(f"  Schwarz: rho = {rho_used:.4e}, {n_sweeps} sweeps, "
+          f"final delta {delta_final:.4e} (tol {args.tol:.1e}"
+          f"{', HIT max_iter' if n_sweeps >= args.max_iter else ''})")
 
 
 if __name__ == "__main__":

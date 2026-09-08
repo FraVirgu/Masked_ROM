@@ -180,7 +180,7 @@ if __name__ == "__main__":
                         help="coupling coefficient (kappa)")
     parser.add_argument("-radius", type=float, default=5.0,
                         help="radius of the cylindrical boundary")
-    parser.add_argument("-height", type=float, default=1.0,
+    parser.add_argument("-height", type=float, default=3.0,
                         help="total extent of the cylinder along its axis")
     parser.add_argument("-axis", choices=("x", "y", "z"), default="z",
                         help="direction of the cylinder axis")

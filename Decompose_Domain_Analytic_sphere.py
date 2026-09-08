@@ -555,13 +555,14 @@ def solve_partition_domain(
     return subdomains
 
 
+LENGTH_SUB = 5.0
 
 def decomposeDomain(
     solver,
     boundary,
-    x_ROM_lenght=5.0,
-    y_ROM_lenght=5.0,
-    z_ROM_lenght=5.0,
+    x_ROM_lenght=LENGTH_SUB,
+    y_ROM_lenght=LENGTH_SUB,
+    z_ROM_lenght=LENGTH_SUB,
     restrict_global_C=False,
 ):
     """Build the subdomains and solve each one in isolation.
@@ -877,6 +878,12 @@ if __name__ == "__main__":
                         help="radius of the spherical boundary")
     args = parser.parse_args()
 
+    # n = discretizatin point in each direction of the full domain 
+    #   => depends from the lenght of the subdomain, each subdomain should have n_sub = 20 discretization point, so the discretization point for the globla domain shold be #sub * 20, with #sub is the number of subdomain.
+    # Morover the dimension of the gloabl background cube should be a multiple od the dimension of the sub domain. 
+
+
+
     # nets/{name}/ holds every mesh file this run writes and the solver reads.
     #
     # Domain's export_* methods build filenames as f"{self.name}_marked_mesh.xdmf"
@@ -948,6 +955,7 @@ if __name__ == "__main__":
         sigma1d         = args.sigma1d,
         kappa           = args.kappa,
         exterior        = "dirichlet",
+        lenght_sub_domain = LENGTH_SUB
     ).build().solve()
 
     solver.save(out_dir)

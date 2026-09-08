@@ -1,0 +1,16 @@
+# Fast environment setup -- no rebuild.
+# Use:  source source_me_fast.rc
+#
+# Assumes source_me.rc has already been run once on this machine, i.e.
+# hazmath is built+installed, the swig bindings exist, and the xii
+# ufl_legacy -> ufl patch is applied. If imports fail, fall back to
+# source_me.rc for the full rebuild.
+
+HAZ_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]:-$0}" )" && pwd )"
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate fenics-env
+
+export PYTHONPATH="$HAZ_ROOT/hazmath/swig_files:$PYTHONPATH"
+
+unset HAZ_ROOT
