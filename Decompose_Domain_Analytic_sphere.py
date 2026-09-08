@@ -554,7 +554,7 @@ def solve_partition_domain(
 
     return subdomains
 
-
+DISCRETIZATION_POINT_SUB_DOMAIN = 20
 LENGTH_SUB = 5.0
 
 def decomposeDomain(
@@ -955,7 +955,8 @@ if __name__ == "__main__":
         sigma1d         = args.sigma1d,
         kappa           = args.kappa,
         exterior        = "dirichlet",
-        lenght_sub_domain = LENGTH_SUB
+        lenght_sub_domain = LENGTH_SUB,
+        n_sub = DISCRETIZATION_POINT_SUB_DOMAIN
     ).build().solve()
 
     solver.save(out_dir)

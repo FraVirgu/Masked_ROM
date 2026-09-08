@@ -33,6 +33,8 @@ from Decompose_Domain_Analytic_sphere import (  # noqa: F401
     mark_artificial_facets,
     matrix_to_csr,
     solve_partition_domain,
+    LENGTH_SUB,
+    DISCRETIZATION_POINT_SUB_DOMAIN
 )
 
 AXES = {"x": 0, "y": 1, "z": 2}
@@ -268,6 +270,8 @@ if __name__ == "__main__":
         sigma1d         = args.sigma1d,
         kappa           = args.kappa,
         exterior        = "dirichlet",
+        lenght_sub_domain = LENGTH_SUB,
+        n_sub = DISCRETIZATION_POINT_SUB_DOMAIN
     ).build().solve()
 
     solver.save(out_dir)

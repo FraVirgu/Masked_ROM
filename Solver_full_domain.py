@@ -133,7 +133,8 @@ class Solver3D1D:
         beta_nitsche: float = 1.0,
         inlet_tag: int = 111,
         exterior: str = "dirichlet",
-        lenght_sub_domain = None
+        lenght_sub_domain = None,
+        n_sub = None
     ):
         if exterior != "dirichlet":
             raise ValueError(
@@ -178,6 +179,9 @@ class Solver3D1D:
         self.niters = None
         self.solve_time = None
         self.pressure_path_report = None
+
+        self.lenght_sub_domain = lenght_sub_domain
+        self.n_sub = n_sub
 
     def build(self):
         self._load_meshes()
@@ -270,13 +274,91 @@ class Solver3D1D:
     def _load_meshes(self):
         if self.full_domain_mesh is None:
             if self.boundary is None:
+                self.augment = False
                 self.meshV = BoxMesh(Point(-1, -1, -1), Point(1, 1, 1), self.n, self.n, self.n)
             else:
+                self.augment = True
                 bbox = self.boundary._bbox
                 (xmin, xmax), (ymin, ymax), (zmin, zmax) = bbox
                 self.meshV = BoxMesh(Point(xmin, ymin, zmin), Point(xmax, ymax, zmax), self.n, self.n, self.n)
         else:
             self.meshV = self.full_domain_mesh
+            self.augment = True
+
+        # Every domain that reaches this point is meshed on a CUBE -- the
+        # sphere because its bbox is cubic by construction, the cylinder
+        # because cylinder_background_mesh hands us enclosing_cube. So one
+        # side length describes the mesh, and growing it keeps it a cube.
+        #
+        # decomposeDomain splits each axis into ceil(extent / lenght_sub_domain)
+        # slabs and clamps the last one to the domain edge. When the extent is
+        # not a whole multiple of that length the final slab is a short
+        # remainder: the boxes are unequal, and the artificial cut planes fall
+        # wherever searchsorted lands rather than on a mesh node. Growing the
+        # cube to the next exact multiple removes both problems -- every box is
+        # then the same size and every cut plane is a grid line.
+        #
+        # The domain itself does not change. The added shell lies outside the
+        # sphere/cylinder, so the midpoint test below marks all of it exterior
+        # and the Dirichlet elimination removes it from the system.
+        if self.augment and self.lenght_sub_domain is not None:
+            L = float(self.lenght_sub_domain)
+            if L <= 0.0:
+                raise ValueError(
+                    f"lenght_sub_domain must be positive, got {L!r}.")
+            # n is derived from n_sub below, so it has to be there.
+            if self.n_sub is None or int(self.n_sub) < 1:
+                raise ValueError(
+                    f"lenght_sub_domain={L:g} needs n_sub (discretization "
+                    f"points per subdomain) to size the global mesh, got "
+                    f"{self.n_sub!r}.")
+            self.n_sub = int(self.n_sub)
+
+            c = self.meshV.coordinates()
+            lo = float(c.min())
+            hi = float(c.max())
+            extent = hi - lo
+
+            # Number of whole subdomains needed to cover the current cube.
+            # Named n_boxes, not n_sub: self.n_sub is the discretization count
+            # WITHIN one subdomain, a different quantity entirely.
+            n_boxes = max(1, int(np.ceil(extent / L - 1e-12)))
+            extent_new = n_boxes * L
+
+            # Grow symmetrically so the domain stays centred on the same point
+            # -- the vessel network and the boundary object are both built
+            # around that centre and neither is rebuilt here.
+            pad = 0.5 * (extent_new - extent)
+            lo_new, hi_new = lo - pad, hi + pad
+
+            # The global discretization follows from the decomposition rather
+            # than being supplied independently: n_sub points per subdomain
+            # along one direction, n_boxes subdomains along it, hence
+            #
+            #     n = n_sub * n_boxes
+            #
+            # This is what puts every artificial cut plane on a grid line --
+            # each box spans exactly n_sub cells, so the box edges land on mesh
+            # nodes instead of wherever searchsorted happens to fall.
+            n_new = self.n_sub * n_boxes
+            if n_new != self.n:
+                print(
+                    f"  n overridden by the decomposition: {self.n} -> {n_new}"
+                    f"  ({self.n_sub} points/subdomain x {n_boxes} subdomains)"
+                )
+            self.n = n_new
+
+            self.meshV = BoxMesh(
+                Point(lo_new, lo_new, lo_new),
+                Point(hi_new, hi_new, hi_new),
+                self.n, self.n, self.n,
+            )
+            print(
+                f"  background cube sized to lenght_sub_domain={L:g}: "
+                f"[{lo:.4g},{hi:.4g}] -> [{lo_new:.4g},{hi_new:.4g}]  "
+                f"({n_boxes} subdomains/axis, {self.n_sub} cells each, "
+                f"h {extent / max(self.n, 1):.4g} -> {extent_new / self.n:.4g})"
+            )
 
         self.meshV_full = self.meshV
 

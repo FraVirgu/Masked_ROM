@@ -49,6 +49,8 @@ from matplotlib.colors import Normalize
 from dolfin import Function
 
 from Decompose_Domain_Analytic_sphere import (
+    DISCRETIZATION_POINT_SUB_DOMAIN,
+    LENGTH_SUB,
     check_sphere_domain_consistency,
     decomposeDomain,
 )
@@ -177,9 +179,6 @@ def main():
             "solution",
             f"Simple{args.name}_n{args.n}"
             f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}")
-    sol_npy = os.path.join(args.solution, "solution.npy")
-    if not os.path.isdir(os.path.join("nets", args.name)):
-        raise SystemExit(f"nets/{args.name} does not exist.")
 
     # ---- rebuild operators, reuse or recompute the global field ------------
     mesh_prefix = os.path.join("nets", args.name, args.name) + "_"
@@ -196,28 +195,27 @@ def main():
     check_sphere_domain_consistency(
         boundary=boundary, n_min=-args.radius, n_max=args.radius)
 
+    # Built exactly as Decompose_Domain_Analytic_sphere's driver builds it:
+    # lenght_sub_domain/n_sub make the solver size the background cube from the
+    # decomposition (see Solver3D1D._load_meshes), so the mesh solved here is
+    # the one the decomposition below will split. Omitting them would solve on
+    # a different -- unaugmented -- mesh whose cut planes miss the grid.
     solver = Solver3D1D(
         path_to_1D_mesh=mesh_prefix, boundary=boundary, n=args.n,
         sigma3d=args.sigma3d, sigma1d=args.sigma1d, kappa=args.kappa,
-        exterior="dirichlet").build()
+        exterior="dirichlet",
+        lenght_sub_domain=LENGTH_SUB,
+        n_sub=DISCRETIZATION_POINT_SUB_DOMAIN).build().solve()
 
-    n_3d, n_1d = solver.W[0].dim(), solver.W[1].dim()
-    x_np = None
-    if os.path.isfile(sol_npy):
-        cand = np.load(sol_npy)
-        if cand.size == n_3d + n_1d:
-            x_np = cand
-            print(f"Loaded global solution from {sol_npy}")
-    if x_np is None:
-        print(f"No usable solution in {args.solution} -- running the global "
-                f"3D-1D solve (this is the expensive step).")
-        raise RuntimeError("file's name must agree")
-
-    solver.x_np = x_np
-    solver.u3d = Function(solver.W[0])
-    solver.u1d = Function(solver.W[1])
-    solver.u3d.vector()[:] = x_np[:n_3d]
-    solver.u1d.vector()[:] = x_np[n_3d:]
+    # The global solve is ALWAYS recomputed, never loaded from disk. The
+    # background mesh now depends on LENGTH_SUB and
+    # DISCRETIZATION_POINT_SUB_DOMAIN (Solver3D1D sizes the cube from them), so
+    # a solution.npy written by an earlier run may belong to a different mesh.
+    # Its size alone does not prove otherwise -- two different decompositions
+    # can produce the same dof count -- so reusing it risks drawing one mesh's
+    # field on another mesh's geometry. Solving here is the expensive step and
+    # is the price of that guarantee.
+    solver.save(args.solution)
 
     subdomains = decomposeDomain(
         solver, boundary, restrict_global_C=args.restrict_global_C)
@@ -263,14 +261,20 @@ def main():
         raise SystemExit("no global dofs on the cut plane -- wrong -axis?")
     print(f"global dofs on the plane: {gsel.size}")
 
-    # Exterior dofs carry no physical value; drop them from the colour scale.
+    # Exterior dofs are KEPT and drawn. The Dirichlet elimination pins them to
+    # u = 0, so that is their value -- it is background, not missing data, and
+    # dropping it left the triangulation covering only the wetted band and the
+    # rest of the panel blank. They are still excluded from the colour SCALE,
+    # since a large block of zeros would otherwise stretch it and flatten the
+    # contrast over the region that carries the solution.
     ext_g = np.zeros(V.dim(), dtype=bool)
     if getattr(solver, "ext_dofs", None) is not None:
         ext_g[np.asarray(solver.ext_dofs, dtype=int)] = True
-    keep = ~ext_g[gsel]
-    gsel, gvals = gsel[keep], u_star[gsel][keep]
+    gvals = u_star[gsel]
+    interior = gvals[~ext_g[gsel]]
+    scale = interior if interior.size else gvals
 
-    norm = Normalize(vmin=float(gvals.min()), vmax=float(gvals.max()))
+    norm = Normalize(vmin=float(scale.min()), vmax=float(scale.max()))
     cmap = "viridis"
     # Errors get a sequential map that reads as "zero is good", distinct from
     # the pressure map so the two panel types are not confused at a glance.
@@ -289,12 +293,10 @@ def main():
             c = ps.V.tabulate_dof_coordinates().reshape((ps.V.dim(), -1))
             u = (sd["_u_raw"] if field_key == "raw"
                  else sd["u3d_partition_schwarz"].vector().get_local())
+            # Exterior dofs kept for the same reason as the global panel: they
+            # are pinned to 0 by the elimination, so they are background the
+            # error panels should show as zero error, not holes in the mesh.
             s = plane_dofs(c, ax_i, cut, tol)
-            ext = getattr(ps, "ext_dofs", None)
-            if ext is not None and np.size(ext):
-                live = np.ones(ps.V.dim(), dtype=bool)
-                live[np.asarray(ext, dtype=int)] = False
-                s = s[live[s]]
             pts.append(c[s])
             vals.append(u[s])
             ref.append(u_star[l2g[s]])
@@ -339,11 +341,19 @@ def main():
 
     a_lines, b_lines = subdomain_seams(idx_lo + idx_hi, ax_i)
     print(f"subdomain seams on the plane: {len(a_lines)} + {len(b_lines)}")
+    # Frame the whole DOMAIN, not just the coloured data. Exterior dofs are
+    # dropped before plotting, so on a domain that does not fill its background
+    # cube -- a cylinder of height < 2*radius, say -- the surviving dofs cover
+    # only a band of the cut plane. Letting matplotlib fit the axes to that band
+    # (and set_aspect('equal') then shrink them) draws a rectangle and hides
+    # that the subdomains are equal cubes. Taking the limits from the global
+    # mesh instead keeps every panel square when the decomposition is square,
+    # and keeps all the subdomain seams visible whether or not they carry data.
+    a_dim, b_dim = [d for d in (0, 1, 2) if d != ax_i]
+    dom_lo, dom_hi = coords_g.min(axis=0), coords_g.max(axis=0)
     for ax in axes:
-        # Freeze the data limits first: axvline/axhline span the full axis and
-        # would otherwise let a seam at the rim rescale the panel.
-        ax.set_xlim(ax.get_xlim())
-        ax.set_ylim(ax.get_ylim())
+        ax.set_xlim(dom_lo[a_dim], dom_hi[a_dim])
+        ax.set_ylim(dom_lo[b_dim], dom_hi[b_dim])
         draw_subdomain_seams(ax, a_lines, b_lines)
 
     out = args.out or f"interface_wall_schwarz_{args.name}_{args.axis}.png"

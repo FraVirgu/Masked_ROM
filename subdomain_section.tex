@@ -1,0 +1,36 @@
+\section{Defining the sub-domain dimension}
+
+The main assumption of the ROM method is that every sub-domain is the same: the same side length $L$ and the same number of discretization points $n_i$ per direction. The reduced basis is built once and reused on all of them, so a sub-domain that is shorter than its neighbours -- or carries a different number of dofs -- is not a case the surrogate can represent.
+
+Nothing in the geometry guarantees this. The global domain is a sphere or a cylinder, and the background mesh is a cube enclosing it; that cube's side is fixed by the radius and has no reason to be a whole multiple of $L$. When it is not, the decomposition covers the domain with $\lceil \text{extent}/L \rceil$ slabs per direction and clamps the last one to the domain edge, so the final sub-domain along each axis is a short remainder. Two consequences follow, and both break the assumption above: the boxes are no longer identical, and the artificial cut planes no longer fall on mesh nodes, so the interface a sub-domain sees is not a grid surface of the global mesh.
+
+Two modifications of the code remove this. Both act on the background cube, before the decomposition runs, and neither changes the physical domain:
+
+\begin{itemize}
+    \item \textbf{Augment the cube} so that its side is an exact multiple of $L$;
+    \item \textbf{Derive the global discretization} from the decomposition, as $n = n_i \cdot N$ with $N$ the resulting number of sub-domains per direction, so that the cube's grid is compatible with the sub-domain grid.
+\end{itemize}
+
+\subsection*{Augmenting the dimension of the shape}
+
+The background of the global solution has to be a cube. For the sphere this is automatic -- its bounding box is cubic by construction -- while for the cylinder it is not, unless $h = 2r$: the tight bounding box is the slab $[-r,r]^2 \times [-h/2,h/2]$, and meshing it would leave every cell midpoint inside the domain, so nothing would be marked exterior and the cylinder would silently degenerate into a box. The cylinder is therefore meshed on its enclosing cube, of side $\max(2r, h)$, and the solver's own midpoint test carves the cylinder out of it exactly as it carves the sphere.
+
+Starting from that cube, of side $\ell$, the number of sub-domains per direction is
+\[
+N = \left\lceil \frac{\ell}{L} \right\rceil ,
+\qquad
+\ell_{\text{new}} = N\,L \;\geq\; \ell ,
+\]
+and the cube is grown symmetrically about its centre, by $(\ell_{\text{new}} - \ell)/2$ on each side, until its side is $\ell_{\text{new}}$. Growing it symmetrically is what keeps the enlargement invisible to the rest of the problem: the vessel network and the boundary object are both built around the centre and neither is rebuilt.
+
+The domain itself is unchanged by this operation. The added shell lies entirely outside the sphere or the cylinder, so every cell in it fails the midpoint test, is marked exterior, and is removed from the system by the same Dirichlet elimination that already removes the corners of the original cube. The cost is a larger mesh with more eliminated dofs, not a different physical problem.
+
+\subsection*{Compatible discretization}
+
+Augmenting the cube makes the sub-domains equal in size but not yet equal in dofs: the extent being a multiple of $L$ does not by itself put the cut planes on mesh nodes. With $\ell = 10$, $L = 2.5$ and $n = 30$, for instance, the extent is an exact multiple of $L$ but each sub-domain spans $7.5$ cells, and two of the three interior cut planes fall in the middle of a cell.
+
+The global discretization is therefore not supplied independently but derived from the decomposition. Fixing $n_i$ discretization points per sub-domain along one direction, and having $N$ sub-domains along it, the global cube is meshed with
+\[
+n = n_i \cdot N
+\]
+points per direction. Each sub-domain then spans exactly $n_i$ cells, every cut plane is a grid line of the global mesh, and the interface dofs of two neighbouring boxes coincide instead of having to be interpolated. In the simulations that follow $L = 5$ and $n_i = 20$; on a sphere of radius $5$ this gives $N = 2$ and $n = 40$, i.e.\ the configuration already used in the previous sections, which is why those results are unaffected by this change.
