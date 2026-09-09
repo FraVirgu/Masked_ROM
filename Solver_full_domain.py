@@ -120,6 +120,11 @@ class Solver3D1D:
     cell markers, or it can be inferred from a Boundary object.
     """
 
+    # Clearance between the geometry and the faces of the background box. A
+    # bbox hugs the geometry exactly, which puts the outer Dirichlet boundary
+    # on the domain surface itself; this pads it away on every face.
+    BBOX_EPS = 0.5
+
     def __init__(
         self,
         path_to_1D_mesh: str,
@@ -280,8 +285,23 @@ class Solver3D1D:
                 self.augment = True
                 bbox = self.boundary._bbox
                 (xmin, xmax), (ymin, ymax), (zmin, zmax) = bbox
-                self.meshV = BoxMesh(Point(xmin, ymin, zmin), Point(xmax, ymax, zmax), self.n, self.n, self.n)
+                print("Here")
+                # The bbox touches the geometry: a sphere of radius 2 gives a
+                # box whose faces sit exactly on +-2, so the outer boundary and
+                # the domain surface coincide. Pad every face by BBOX_EPS so
+                # there is always a layer of exterior cells between the two.
+                self.meshV = BoxMesh(
+                    Point(xmin - self.BBOX_EPS, ymin - self.BBOX_EPS, zmin - self.BBOX_EPS),
+                    Point(xmax + self.BBOX_EPS, ymax + self.BBOX_EPS, zmax + self.BBOX_EPS),
+                    self.n, self.n, self.n,
+                )
         else:
+            # A supplied mesh is NOT padded here. full_domain_markers is built
+            # against this exact mesh object by the callers, and self.n is not
+            # its resolution (test_robin_minimal passes num_cells), so
+            # rebuilding it would invalidate the markers and mis-size the box.
+            # Callers that need the clearance apply it when they build the
+            # mesh -- see cylinder_background_mesh / enclosing_cube.
             self.meshV = self.full_domain_mesh
             self.augment = True
 

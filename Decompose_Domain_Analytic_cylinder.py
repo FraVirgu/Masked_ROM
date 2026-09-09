@@ -132,8 +132,14 @@ def cylinder_background_mesh(radius, height, n, axis="z", center=(0.0, 0.0, 0.0)
     boundary object and the shared solver untouched.
     """
     from dolfin import BoxMesh, Point
+    from Solver_full_domain import Solver3D1D
 
+    # The cube touches the cylinder wall at +-radius, putting the outer
+    # Dirichlet boundary on the domain surface. Pad it by the same clearance
+    # the solver applies to a bbox it meshes itself, so the two paths agree.
+    eps = Solver3D1D.BBOX_EPS
     n_min, n_max = enclosing_cube(radius, height, axis, center)
+    n_min, n_max = n_min - eps, n_max + eps
     return BoxMesh(
         Point(n_min, n_min, n_min), Point(n_max, n_max, n_max), n, n, n
     )
