@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from Analytic_Domain import Domain
-from dolfin import Function
+from dolfin import Function, XDMFFile
 
 from Decompose_Domain_Analytic_cylinder import (
     DISCRETIZATION_POINT_SUB_DOMAIN,
@@ -75,9 +75,9 @@ def main():
                         help="3D conductivity (sigma3d)")
     parser.add_argument("-kappa", type=float, default=1.0,
                         help="coupling coefficient (kappa)")
-    parser.add_argument("-radius", type=float, default=5.0,
+    parser.add_argument("-radius", type=float, default=2.0,
                         help="radius of the cylindrical boundary")
-    parser.add_argument("-height", type=float, default=3.0,
+    parser.add_argument("-height", type=float, default=2.0,
                         help="total extent of the cylinder along its axis")
 
     parser.add_argument("-cyl_axis", choices=("x", "y", "z"), default="z",
@@ -172,6 +172,7 @@ def main():
         f"Simple{args.name}_n{args.n}"
         f"_s1d{args.sigma1d}_s3d{args.sigma3d}_k{args.kappa}")
     solver.save(out_dir)
+    solver.save_paraview(f"{out_dir}/paraview")
 
     # LENGTH_SUB is the single source of truth: the solver has just sized
     # the background cube to a multiple of LENGTH_SUB, so decomposing on any
@@ -189,6 +190,23 @@ def main():
 
     result = apply_robin_residual(
         subdomains, solver, rho_robin=args.rho, cross=args.cross)
+
+    # Post-method subdomain fields, one file per box. This is u3d_robin -- the
+    # local solve AFTER the Robin transmission term, not partition_solver.u3d,
+    # which is the isolated solve with no communication and is what
+    # PartitionSolver.save_paraview would write.
+    sub_dir = os.path.join(out_dir, "subdomain")
+    os.makedirs(sub_dir, exist_ok=True)
+    for sd in subdomains:
+        i, j, k = sd["ijk"]
+        fn = sd["u3d_robin"]
+        fn.rename("u3d_robin", "3D pressure after Robin transmission")
+        with XDMFFile(f"{sub_dir}/u3d_robin_{i}_{j}_{k}.xdmf") as f:
+            f.parameters["flush_output"] = True
+            f.parameters["functions_share_mesh"] = True
+            f.write(fn)
+    print(f"Subdomain solutions saved → {sub_dir} "
+          f"({len(subdomains)} boxes)")
 
     # ---- draw one cut plane -------------------------------------------------
     # Called once per axis. Everything expensive -- the global solve and the

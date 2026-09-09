@@ -555,7 +555,7 @@ def solve_partition_domain(
     return subdomains
 
 DISCRETIZATION_POINT_SUB_DOMAIN = 20
-LENGTH_SUB = 5.0
+LENGTH_SUB = 1.0
 
 def decomposeDomain(
     solver,
