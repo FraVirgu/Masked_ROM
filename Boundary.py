@@ -195,6 +195,123 @@ class CylinderBoundary(Boundary):
         )
 
 
+class CylinderSphereBoundary(Boundary):
+    """Union of a finite cylinder and a sphere, forced to overlap.
+
+    Inside is the set union of the two primitives, so the result is a single
+    connected solid -- a cylinder with a ball stuck on it. The sphere centre is
+    placed on the cylinder axis at `sphere_offset` from the cylinder centre;
+    the default puts it on one cap, which always overlaps because the cap disc
+    sits inside the ball whenever `sphere_radius > 0`.
+
+    The overlap is checked at construction: a sphere that only touches, or that
+    misses the cylinder entirely, would give a disconnected (or pinched) domain
+    and the decomposition downstream assumes one connected component.
+    """
+
+    _AXES = CylinderBoundary._AXES
+
+    def __init__(
+        self,
+        radius=1.0,
+        height=2.0,
+        sphere_radius=None,
+        center=(0.0, 0.0, 0.0),
+        sphere_offset=None,
+        axis="z",
+        inlet_points=None,
+        outlet_points=None,
+        border_eps=1e-2,
+        min_overlap=1e-9,
+    ):
+        self.radius = float(radius)
+        self.height = float(height)
+        self.center = np.asarray(center, dtype=float)
+        if self.radius <= 0.0:
+            raise ValueError("radius must be positive for CylinderSphereBoundary.")
+        if self.height <= 0.0:
+            raise ValueError("height must be positive for CylinderSphereBoundary.")
+        if axis not in self._AXES:
+            raise ValueError(f"axis must be one of {tuple(self._AXES)}.")
+        self.axis = axis
+        ai = self._AXES[axis]
+        self._axis_index = ai
+
+        # Defaults: a ball as wide as the tube, centred on the +axis cap.
+        self.sphere_radius = (
+            self.radius if sphere_radius is None else float(sphere_radius)
+        )
+        if self.sphere_radius <= 0.0:
+            raise ValueError(
+                "sphere_radius must be positive for CylinderSphereBoundary."
+            )
+        half = 0.5 * self.height
+        offset = half if sphere_offset is None else float(sphere_offset)
+        self.sphere_offset = offset
+
+        # The sphere rides on the cylinder axis: the union is then rotationally
+        # symmetric about that axis, like the two primitives are.
+        self.sphere_center = self.center.copy()
+        self.sphere_center[ai] += offset
+
+        # Overlap test. Along the axis the ball reaches `|offset| - sphere_radius`
+        # past the centre; it bites into the slab as long as that stays strictly
+        # inside the near cap. Off-axis placement is not allowed, so the radial
+        # direction can never separate the two.
+        axial_gap = abs(offset) - self.sphere_radius - half
+        if axial_gap >= -min_overlap:
+            raise ValueError(
+                "sphere does not overlap the cylinder: "
+                f"|sphere_offset| ({abs(offset)}) must be smaller than "
+                f"half the height ({half}) + sphere_radius "
+                f"({self.sphere_radius}). Gap = {axial_gap}."
+            )
+
+        # Union bbox: the component-wise hull of the two tight boxes.
+        ext = [self.radius, self.radius, self.radius]
+        ext[ai] = half
+        sr = self.sphere_radius
+        self._bbox = tuple(
+            (
+                min(self.center[d] - ext[d], self.sphere_center[d] - sr),
+                max(self.center[d] + ext[d], self.sphere_center[d] + sr),
+            )
+            for d in range(3)
+        )
+
+        t0, t1 = [d for d in (0, 1, 2) if d != ai]
+        c = self.center
+        sc = self.sphere_center
+        r = self.radius
+
+        def inside(x, y, z):
+            p = (x, y, z)
+            radial = (p[t0] - c[t0]) ** 2 + (p[t1] - c[t1]) ** 2
+            in_cyl = (radial <= r ** 2) and (abs(p[ai] - c[ai]) <= half)
+            if in_cyl:
+                return True
+            d2 = (
+                (p[0] - sc[0]) ** 2 + (p[1] - sc[1]) ** 2 + (p[2] - sc[2]) ** 2
+            )
+            return d2 <= sr ** 2
+
+        super().__init__(
+            source=inside,
+            bbox=None,
+            inlet_points=inlet_points,
+            outlet_points=outlet_points,
+            border_eps=border_eps,
+        )
+
+    def __repr__(self):
+        return (
+            f"CylinderSphereBoundary(radius={self.radius!r}, "
+            f"height={self.height!r}, sphere_radius={self.sphere_radius!r}, "
+            f"sphere_offset={self.sphere_offset!r}, axis={self.axis!r}, "
+            f"center={tuple(self.center)!r})"
+        )
+
+
 np.random.seed(42)
 
 def random_sphere_points(
@@ -285,6 +402,93 @@ def random_cylinder_points(
         v[ai] = np.random.uniform(-half, half)
         if sign * v[si] > min_offset * span:
             pts.append((center + v).tolist())
+    return pts
+
+
+def random_cylinder_sphere_points(
+    n,
+    sign,
+    radius=1.0,
+    height=2.0,
+    sphere_radius=None,
+    sphere_offset=None,
+    axis="z",
+    min_offset=0.2,
+    min_dist_to_boundary=0.06,
+    center=(0.0, 0.0, 0.0),
+):
+    """Sample `n` points strictly inside a CylinderSphereBoundary.
+
+    Same convention as the other samplers: `sign` (+1/-1) picks a lobe, so an
+    inlet and an outlet set can be drawn separately. Here the split is always
+    along the cylinder axis and is anchored on the cylinder centre -- sign
+    towards the sphere draws from the ball, the other sign from the far half of
+    the tube. `min_dist_to_boundary` is kept from whichever surface is nearest,
+    curved wall, cap or sphere, so no point lands on the union's boundary.
+    """
+    axes = CylinderBoundary._AXES
+    if axis not in axes:
+        raise ValueError(f"axis must be one of {tuple(axes)}.")
+    ai = axes[axis]
+
+    radius, height = float(radius), float(height)
+    if radius <= 0.0:
+        raise ValueError("radius must be positive when sampling union points.")
+    if height <= 0.0:
+        raise ValueError("height must be positive when sampling union points.")
+    sphere_radius = radius if sphere_radius is None else float(sphere_radius)
+    if sphere_radius <= 0.0:
+        raise ValueError("sphere_radius must be positive when sampling union points.")
+    half_h = 0.5 * height
+    offset = half_h if sphere_offset is None else float(sphere_offset)
+
+    max_radius = radius - min_dist_to_boundary
+    half = half_h - min_dist_to_boundary
+    max_sphere = sphere_radius - min_dist_to_boundary
+    if max_radius <= 0.0 or half <= 0.0 or max_sphere <= 0.0:
+        raise ValueError(
+            "min_dist_to_boundary must be smaller than the cylinder radius, "
+            "than half its height, and than the sphere radius."
+        )
+
+    center = np.asarray(center, dtype=float)
+    sphere_center = center.copy()
+    sphere_center[ai] += offset
+    t0, t1 = [d for d in (0, 1, 2) if d != ai]
+
+    # Which lobe this sign asks for: the sphere sits on the side of the
+    # cylinder centre that `offset` points to.
+    towards_sphere = sign * offset > 0.0
+
+    pts = []
+    while len(pts) < n:
+        if towards_sphere:
+            # Rejection inside the shrunk ball; keep only what the shrunk ball
+            # alone contains, so the point is clear of the union surface even
+            # where the cap cuts through.
+            v = np.random.randn(3)
+            v /= np.linalg.norm(v)
+            v *= max_sphere * np.random.uniform(0.0, 1.0) ** (1.0 / 3.0)
+            p = sphere_center + v
+            # Stay past the cylinder centre, mirroring min_offset elsewhere.
+            if sign * (p[ai] - center[ai]) <= min_offset * abs(offset):
+                continue
+        else:
+            theta = np.random.uniform(0.0, 2.0 * np.pi)
+            rr = max_radius * np.sqrt(np.random.uniform(0.0, 1.0))
+            v = np.empty(3)
+            v[t0] = rr * np.cos(theta)
+            v[t1] = rr * np.sin(theta)
+            v[ai] = np.random.uniform(-half, half)
+            if sign * v[ai] <= min_offset * half:
+                continue
+            p = center + v
+            # The sphere may reach into this half; a point closer to its
+            # surface than the tolerance would sit on the union boundary.
+            d = np.linalg.norm(p - sphere_center)
+            if abs(d - sphere_radius) < min_dist_to_boundary:
+                continue
+        pts.append(p.tolist())
     return pts
 
 

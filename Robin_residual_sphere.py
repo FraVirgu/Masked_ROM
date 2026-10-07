@@ -17,6 +17,27 @@ That is all this file does. Diagnostics, exactness checks and the alternative
 transmission schemes live elsewhere; `Decompose_Domain_Analytic.decomposeDomain`
 is used unchanged to build the subdomains.
 
+Phase structure
+---------------
+apply_robin_residual runs three phases, and only two of them are box-local:
+
+    A. extract_local      eq. (4), per box       PARALLEL
+    B. the E_ij exchange  all-to-all             SEQUENTIAL
+    C. solve_local_robin  eq. (5), per box       PARALLEL
+
+Phase B is irreducibly sequential -- it reads every box's f_j and m_j at once,
+and the mu-multiplicity weighting is a property of the whole decomposition --
+but it is cheap: it moves interface data, so its cost scales with cut-plane
+AREA while A and C scale with box VOLUME. Phase C holds the sparse solves and
+is where the time goes.
+
+C u_src, the average over the FULL vessel circle, is the other non-local input:
+a box whose circle straddles a cut holds only part of the arc. It is formed
+once before phase A fans out.
+
+Pass map_fn=pool.map to parallelize A and C. See apply_robin_residual for what
+a pool has to satisfy (order preservation, and the pickling caveat).
+
 Usage
 -----
     from Decompose_Domain_Analytic import decomposeDomain
@@ -203,10 +224,141 @@ def build_local_operator(ps, rho_robin, G_gamma):
     return (ps.A.tocsr() + rho_robin * G_gamma).tocsc()
 
 
+def extract_local(sd, rho_robin, src, g_min, g_max, n_global,
+                  C_glob=None, G_1d=None, C_src=None):
+    """PHASE A, per box: eq. (4) for one subdomain. No neighbour is touched.
+
+    Everything here reads only box i's own operators plus two global-shaped
+    arrays that are read-only and identical for every box (src, and C_src when
+    the cross term is on). Nothing is read from another subdomain's dict, so
+    this is safe to run concurrently over the boxes.
+
+    C_src = C u_src is the one genuinely non-local input: the average over the
+    FULL circle, which box i cannot form alone because part of the arc lies in
+    its neighbour. It is computed once, before the fan-out, by
+    apply_robin_residual -- see the phase split documented there.
+
+    Returns (sd, payload) rather than mutating in place, so a process pool can
+    ship the payload back; apply_robin_residual does the writing.
+    """
+    ps = sd["partition_solver"]
+    l2g = sd["local_to_global_dof"]
+
+    G_gamma, n_tagged = _robin_interface(ps, g_min, g_max)
+    sel = _interface_selector(sd, ps, l2g)
+    facet_markers, _ = mark_artificial_facets(ps, g_min, g_max)
+
+    u_i = src[l2g]
+    b_i = np.asarray(ps.rhs, dtype=float)
+
+    # The 1D-network term. The global coupling block acting on box i's rows
+    # is C_i^T G (C u*), with the FULL C: for a vessel whose averaging
+    # circle straddles a cut, part of that circle lies in a neighbour. The
+    # local operator only supplies C_i^T G (C_i u_i), so the difference
+    #
+    #     X_i = C_i^T G (C u* - C_i u_i)
+    #
+    # is missing from eq. (5) entirely. It is a coupling THROUGH THE VESSEL
+    # NETWORK rather than through the flux across Gamma, and without it
+    # b_i - A_i u* does not vanish in the interior -- which is exactly the
+    # hypothesis eq. (4)'s P_i^Gamma restriction relies on.
+    #
+    # Written against the global C so nothing has to be assumed about how
+    # the columns on the cut plane are shared between boxes; that also makes
+    # it correct when a circle straddles several cuts at once (box edges and
+    # corners), where a pairwise C_j u_j formulation would double-count.
+    cross_i = 0.0
+    n_str = 0
+    if C_src is not None:
+        cross_i = build_cross_term(ps, C_glob, G_1d, C_src, u_i)
+        n_str = count_straddling_nodes(ps, C_glob)
+
+    r_i = b_i - ps.A.dot(u_i) - cross_i + rho_robin * G_gamma.dot(u_i)
+
+    # How much of the residual actually lives on the interface? Eq. (4)
+    # discards everything else, so this fraction has to be ~1 for the
+    # extraction to be meaningful. Measured at ~1% without the cross term.
+    live = np.ones(r_i.size, dtype=bool)
+    ext = getattr(ps, "ext_dofs", None)
+    if ext is not None and np.size(ext):
+        live[np.asarray(ext, dtype=int)] = False
+
+    f_star = np.zeros(n_global, dtype=float)
+    f_star[l2g] = np.where(sel, r_i, 0.0)
+
+    return sd, {
+        "_G_gamma": G_gamma,
+        "_sel": sel,
+        "_mass": _interface_mass(ps, facet_markers),
+        "_n_artificial_facets": n_tagged,
+        "_cross": cross_i,
+        "f_star_minus": f_star,
+        "iface_num": float(np.linalg.norm(r_i[sel & live])) ** 2,
+        "iface_den": float(np.linalg.norm(r_i[live])) ** 2,
+        "n_straddling_nodes": n_str,
+    }
+
+
+def solve_local_robin(sd, rho_robin):
+    """PHASE C, per box: eq. (5) for one subdomain. No neighbour is touched.
+
+    By the time this runs the exchange has already deposited "_f_incoming" on
+    the dict, so the only inputs are box i's own operator, its own rhs, and
+    that pre-computed load. This is the expensive half -- one sparse solve per
+    box -- and it is embarrassingly parallel.
+
+    Returns (sd, payload); the caller writes the results back.
+    """
+    ps = sd["partition_solver"]
+    l2g = sd["local_to_global_dof"]
+
+    f_local = np.asarray(sd["_f_incoming"][l2g], dtype=float)
+    ext = getattr(ps, "ext_dofs", None)
+    if ext is not None and np.size(ext):
+        f_local = f_local.copy()
+        f_local[np.asarray(ext, dtype=int)] = 0.0
+
+    # The cross term belongs on the rhs of eq. (5) as well: it is part of
+    # the equation box i's rows actually satisfy, not only of the
+    # extraction. Note it is frozen at u*, while the solve produces a
+    # different u_i -- that inconsistency is why this does not reach
+    # machine precision even when the extraction is exact.
+    cross_i = sd["_cross"]
+    if not np.isscalar(cross_i) and ext is not None and np.size(ext):
+        cross_i = np.asarray(cross_i).copy()
+        cross_i[np.asarray(ext, dtype=int)] = 0.0
+    A_robin = build_local_operator(ps, rho_robin, sd["_G_gamma"])
+    u_i = spsolve(A_robin,
+                  np.asarray(ps.rhs, dtype=float) + f_local + cross_i)
+
+    u_ref = sd["sol_3d_sub"].vector().get_local()
+    nref = float(np.linalg.norm(u_ref))
+    rel = float(np.linalg.norm(u_ref - u_i)) / nref if nref > 1e-12 else 0.0
+
+    return sd, {"u_i": u_i, "rel": rel}
+
+
 def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
-                         cross=False):
+                         cross=False, map_fn=None):
     """
     Run eqs. (4) and (5) once over all subdomains.
+
+    Structured as three phases, because only two of them are local:
+
+        A. extract_local      -- eq. (4), per box, PARALLEL
+        B. the exchange       -- E_ij, all-to-all, SEQUENTIAL
+        C. solve_local_robin  -- eq. (5), per box, PARALLEL
+
+    The exchange in the middle is irreducibly sequential: it reads every box's
+    f_j and m_j at once, and the mu-multiplicity weighting is defined over the
+    whole decomposition. It is also cheap -- it moves interface data only, so
+    its volume scales with cut-plane AREA while A and C scale with box VOLUME.
+    Phase C is where the time goes.
+
+    One more thing is non-local and easy to miss: C_src = C u_src, the average
+    over the FULL vessel circle. A box whose circle straddles a cut holds only
+    part of the arc, so this cannot be formed box-locally. It is computed once
+    up front, before phase A fans out, and passed in read-only.
 
     Parameters
     ----------
@@ -226,12 +378,27 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
         cut. REQUIRES the subdomains to have been built with
         decomposeDomain(..., restrict_global_C=True): the term is only
         well-posed when C_i carries the global arc weights (see below).
+    map_fn : callable, optional
+        Applied as map_fn(fn, tasks) to run phases A and C. Defaults to the
+        builtin map, i.e. sequential and exactly the previous behaviour. Pass
+        e.g. a pool's map to parallelize. It must preserve ORDER: the phase-C
+        reduction accumulates into shared arrays and the diagnostics are
+        reported per box.
+
+        NOTE a process pool needs the subdomain dicts to be picklable, and they
+        currently hold FEniCS objects (Function, Mesh) that are not. Threads
+        work only insofar as the inner solve releases the GIL. Making this
+        genuinely distributed is a separate change; the hook exists so that the
+        phase boundaries are real and testable now.
 
     Returns
     -------
     dict with "rho", "rel_global", "rel_local", "state", "iface_fraction".
     Each subdomain also gains "u3d_robin" and "f_star_minus".
     """
+    if map_fn is None:
+        map_fn = map
+
     if rho_robin is None:
         rho_robin = float(solver.sigma3d) / max(float(solver.meshV.hmax()), 1e-30)
     rho_robin = float(rho_robin)
@@ -247,67 +414,30 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
     C_glob = solver.C.tocsr()
     C_src = C_glob.dot(src) if cross else None   # the TRUE full-circle average
 
-    # ---- eq. (4): extract, per subdomain ------------------------------------
+    # ---- PHASE A: eq. (4), per subdomain, no neighbour data -----------------
     iface_num = 0.0
     iface_den = 0.0
     n_straddle_tot = 0
 
-    for sd in subdomains:
-        ps = sd["partition_solver"]
-        l2g = sd["local_to_global_dof"]
+    def _extract(sd):
+        return extract_local(sd, rho_robin, src, g_min, g_max, n_global,
+                             C_glob=C_glob, G_1d=solver.G, C_src=C_src)
 
-        G_gamma, n_tagged = _robin_interface(ps, g_min, g_max)
-        sel = _interface_selector(sd, ps, l2g)
-        facet_markers, _ = mark_artificial_facets(ps, g_min, g_max)
-        sd["_G_gamma"] = G_gamma
-        sd["_sel"] = sel
-        sd["_mass"] = _interface_mass(ps, facet_markers)
-        sd["_n_artificial_facets"] = n_tagged
-
-        u_i = src[l2g]
-        b_i = np.asarray(ps.rhs, dtype=float)
-
-        # The 1D-network term. The global coupling block acting on box i's rows
-        # is C_i^T G (C u*), with the FULL C: for a vessel whose averaging
-        # circle straddles a cut, part of that circle lies in a neighbour. The
-        # local operator only supplies C_i^T G (C_i u_i), so the difference
-        #
-        #     X_i = C_i^T G (C u* - C_i u_i)
-        #
-        # is missing from eq. (5) entirely. It is a coupling THROUGH THE VESSEL
-        # NETWORK rather than through the flux across Gamma, and without it
-        # b_i - A_i u* does not vanish in the interior -- which is exactly the
-        # hypothesis eq. (4)'s P_i^Gamma restriction relies on.
-        #
-        # Written against the global C so nothing has to be assumed about how
-        # the columns on the cut plane are shared between boxes; that also makes
-        # it correct when a circle straddles several cuts at once (box edges and
-        # corners), where a pairwise C_j u_j formulation would double-count.
-        cross_i = 0.0
+    # Zipped against the ORIGINAL list, not against the sd the worker handed
+    # back: under a process pool that sd is a copy living in another process,
+    # and writing to it would update nothing the caller can see. This is also
+    # why map_fn must preserve order.
+    for sd, (_, out) in zip(subdomains, map_fn(_extract, subdomains)):
+        for key in ("_G_gamma", "_sel", "_mass", "_n_artificial_facets",
+                    "_cross", "f_star_minus"):
+            sd[key] = out[key]
+        iface_num += out["iface_num"]
+        iface_den += out["iface_den"]
         if cross:
-            cross_i = build_cross_term(ps, C_glob, solver.G, C_src, u_i)
-            n_str = count_straddling_nodes(ps, C_glob)
-            sd["n_straddling_nodes"] = n_str
-            n_straddle_tot += n_str
-        sd["_cross"] = cross_i
+            sd["n_straddling_nodes"] = out["n_straddling_nodes"]
+            n_straddle_tot += out["n_straddling_nodes"]
 
-        r_i = b_i - ps.A.dot(u_i) - cross_i + rho_robin * G_gamma.dot(u_i)
-
-        # How much of the residual actually lives on the interface? Eq. (4)
-        # discards everything else, so this fraction has to be ~1 for the
-        # extraction to be meaningful. Measured at ~1% without the cross term.
-        live = np.ones(r_i.size, dtype=bool)
-        ext = getattr(ps, "ext_dofs", None)
-        if ext is not None and np.size(ext):
-            live[np.asarray(ext, dtype=int)] = False
-        iface_num += float(np.linalg.norm(r_i[sel & live])) ** 2
-        iface_den += float(np.linalg.norm(r_i[live])) ** 2
-
-        f_star = np.zeros(n_global, dtype=float)
-        f_star[l2g] = np.where(sel, r_i, 0.0)
-        sd["f_star_minus"] = f_star
-
-    # ---- E_ij: gather the neighbours' data on the shared interface ----------
+    # ---- PHASE B (SEQUENTIAL): gather the neighbours' data on the interface --
     # Two things here are NOT what a naive reading of eq. (5) suggests, and
     # both are needed; either one alone makes the result worse.
     #
@@ -379,43 +509,28 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
 
         sd["_f_incoming"] = incoming
 
-    # ---- eq. (5): local Robin solve ----------------------------------------
+    # ---- PHASE C: eq. (5), per subdomain, no neighbour data -----------------
+    # The reduction into acc/cnt stays here rather than inside the worker: it
+    # writes into arrays shared by every box, so it is the one part of this
+    # phase that must not run concurrently.
     acc = np.zeros(n_global, dtype=float)
     cnt = np.zeros(n_global, dtype=float)
     rel_local = []
 
-    for sd in subdomains:
+    def _solve(sd):
+        return solve_local_robin(sd, rho_robin)
+
+    for sd, (_, out) in zip(subdomains, map_fn(_solve, subdomains)):
         ps = sd["partition_solver"]
         l2g = sd["local_to_global_dof"]
-
-        f_local = np.asarray(sd["_f_incoming"][l2g], dtype=float)
-        ext = getattr(ps, "ext_dofs", None)
-        if ext is not None and np.size(ext):
-            f_local = f_local.copy()
-            f_local[np.asarray(ext, dtype=int)] = 0.0
-
-        # The cross term belongs on the rhs of eq. (5) as well: it is part of
-        # the equation box i's rows actually satisfy, not only of the
-        # extraction. Note it is frozen at u*, while the solve produces a
-        # different u_i -- that inconsistency is why this does not reach
-        # machine precision even when the extraction is exact.
-        cross_i = sd["_cross"]
-        if not np.isscalar(cross_i) and ext is not None and np.size(ext):
-            cross_i = np.asarray(cross_i).copy()
-            cross_i[np.asarray(ext, dtype=int)] = 0.0
-        A_robin = build_local_operator(ps, rho_robin, sd["_G_gamma"])
-        u_i = spsolve(A_robin,
-                      np.asarray(ps.rhs, dtype=float) + f_local + cross_i)
+        u_i = out["u_i"]
 
         fn = Function(ps.V)
         fn.vector()[:] = u_i
         sd["u3d_robin"] = fn
 
-        u_ref = sd["sol_3d_sub"].vector().get_local()
-        nref = float(np.linalg.norm(u_ref))
-        rel = float(np.linalg.norm(u_ref - u_i)) / nref if nref > 1e-12 else 0.0
-        sd["u3d_robin_rel_l2"] = rel
-        rel_local.append(rel)
+        sd["u3d_robin_rel_l2"] = out["rel"]
+        rel_local.append(out["rel"])
 
         acc[l2g] += u_i
         cnt[l2g] += 1.0

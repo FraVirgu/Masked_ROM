@@ -278,17 +278,27 @@ def eliminate_exterior_local(
 
 
 def solve_partition_domain(
-    subdomains, solver, print_summary=True, restrict_global_C=False
+    subdomains, solver, print_summary=True, restrict_global_C=False,
+    solve_local=True,
 ):
-    """Solve each subdomain in isolation and attach diagnostics.
+    """Assemble each subdomain's operator, and optionally solve it in isolation.
 
-    This is the "raw" baseline: every box is solved with the natural (Neumann)
-    condition on its artificial cut planes, i.e. with no coupling to its
-    neighbours. It is the reference any transmission scheme is measured
-    against, and the starting point they improve on.
+    The isolated solve is the "raw" baseline: every box is solved with the
+    natural (Neumann) condition on its artificial cut planes, i.e. with no
+    coupling to its neighbours. It is the reference any transmission scheme is
+    measured against, and the starting point they improve on.
 
     It must run before any of them: it populates "partition_solver" and the
     per-subdomain error fields they read.
+
+    solve_local=False skips only the isolated solve (and the baseline
+    diagnostics derived from it). A_i, rhs_i and the exterior elimination are
+    still built, so everything the transmission schemes actually consume --
+    partition_solver.A, .rhs, .V, .ext_dofs -- is present. Use it when the
+    Neumann baseline is not being reported: it is one sparse factorization per
+    box, and the schemes never read its result. The per-box raw-error fields
+    are then filled with NaN rather than left missing, so callers that print
+    them keep working.
 
     restrict_global_C=True builds each box's coupling operator by restricting
     the GLOBAL C to that box's columns, instead of re-running circle quadrature
@@ -359,26 +369,38 @@ def solve_partition_domain(
         subdomain["exterior_dofs_eliminated"] = n_ext
         subdomain["interior_dofs_kept"] = n_int
 
-        partition_solver.solve()
         subdomain["partition_solver"] = partition_solver
 
-        u_part_raw = partition_solver.u3d.vector().get_local()
-        subdomain["u3d_partition_raw"] = partition_solver.u3d
-        subdomain["u3d_partition"] = partition_solver.u3d
-
-        # Local reference-vs-partition error on the subdomain mesh.
         u_full_local = subdomain["sol_3d_sub"].vector().get_local()
-        local_error_raw = u_full_local - u_part_raw
         u_full_local_norm = float(np.linalg.norm(u_full_local))
-        subdomain["u3d_partition_error_local_raw"] = local_error_raw
-        subdomain["u3d_partition_error_local_raw_norm_l2"] = float(np.linalg.norm(local_error_raw))
-        subdomain["u3d_partition_error_local_raw_rel_l2"] = (
-            subdomain["u3d_partition_error_local_raw_norm_l2"] / u_full_local_norm
-            if u_full_local_norm > 1e-12
-            else 0.0
-        )
+
+        if solve_local:
+            partition_solver.solve()
+
+            u_part_raw = partition_solver.u3d.vector().get_local()
+            subdomain["u3d_partition_raw"] = partition_solver.u3d
+            subdomain["u3d_partition"] = partition_solver.u3d
+
+            # Local reference-vs-partition error on the subdomain mesh.
+            local_error_raw = u_full_local - u_part_raw
+            subdomain["u3d_partition_error_local_raw"] = local_error_raw
+            subdomain["u3d_partition_error_local_raw_norm_l2"] = float(np.linalg.norm(local_error_raw))
+            subdomain["u3d_partition_error_local_raw_rel_l2"] = (
+                subdomain["u3d_partition_error_local_raw_norm_l2"] / u_full_local_norm
+                if u_full_local_norm > 1e-12
+                else 0.0
+            )
+            subdomain["u3d_partition_local_norm_l2"] = float(np.linalg.norm(u_part_raw))
+        else:
+            u_part_raw = None
+            subdomain["u3d_partition_raw"] = None
+            subdomain["u3d_partition"] = None
+            subdomain["u3d_partition_error_local_raw"] = None
+            subdomain["u3d_partition_error_local_raw_norm_l2"] = float("nan")
+            subdomain["u3d_partition_error_local_raw_rel_l2"] = float("nan")
+            subdomain["u3d_partition_local_norm_l2"] = float("nan")
+
         subdomain["u3d_full_local_norm_l2"] = u_full_local_norm
-        subdomain["u3d_partition_local_norm_l2"] = float(np.linalg.norm(u_part_raw))
         subdomain["partition_rhs_norm_l2"] = float(np.linalg.norm(partition_solver.rhs))
         subdomain["partition_rhs_b0_norm_l2"] = float(np.linalg.norm(partition_solver.rhs_b0))
         subdomain["partition_rhs_coupling_norm_l2"] = float(
@@ -394,7 +416,8 @@ def solve_partition_domain(
         )
 
         # Contribute raw partition solution to a reconstructed full-domain field.
-        u_partition_sum_raw[local_to_global_dof] += u_part_raw
+        if u_part_raw is not None:
+            u_partition_sum_raw[local_to_global_dof] += u_part_raw
         u_partition_count_raw[local_to_global_dof] += 1.0
 
     covered_raw = u_partition_count_raw > 0.0
@@ -420,13 +443,22 @@ def solve_partition_domain(
 
     full_ref_l2 = float(np.linalg.norm(u3d_full_vec))
 
-    full_error_raw = u3d_full_vec - u3d_reconstructed_raw_vec
-    full_error_raw_l2 = float(np.linalg.norm(full_error_raw))
-    full_error_raw_rel_l2 = full_error_raw_l2 / full_ref_l2 if full_ref_l2 > 0.0 else 0.0
+    if solve_local:
+        full_error_raw = u3d_full_vec - u3d_reconstructed_raw_vec
+        full_error_raw_l2 = float(np.linalg.norm(full_error_raw))
+        full_error_raw_rel_l2 = full_error_raw_l2 / full_ref_l2 if full_ref_l2 > 0.0 else 0.0
 
-    full_error = u3d_full_vec - u3d_reconstructed_vec
-    full_error_l2 = float(np.linalg.norm(full_error))
-    full_error_rel_l2 = full_error_l2 / full_ref_l2 if full_ref_l2 > 0.0 else 0.0
+        full_error = u3d_full_vec - u3d_reconstructed_vec
+        full_error_l2 = float(np.linalg.norm(full_error))
+        full_error_rel_l2 = full_error_l2 / full_ref_l2 if full_ref_l2 > 0.0 else 0.0
+    else:
+        # Nothing was solved, so the "reconstruction" is the zero field on every
+        # covered dof; reporting its distance from u* would look like a 100%
+        # baseline error rather than a skipped measurement.
+        full_error_raw_l2 = float("nan")
+        full_error_raw_rel_l2 = float("nan")
+        full_error_l2 = float("nan")
+        full_error_rel_l2 = float("nan")
     covered_count = int(np.count_nonzero(covered))
     uncovered_count = int(n_global - covered_count)
     overlap_count = int(np.count_nonzero(u_partition_count_raw > 1.0))
@@ -480,18 +512,21 @@ def solve_partition_domain(
             f"min=({cell_counts[:, 0].min()}, {cell_counts[:, 1].min()}, {cell_counts[:, 2].min()}) "
             f"max=({cell_counts[:, 0].max()}, {cell_counts[:, 1].max()}, {cell_counts[:, 2].max()})"
         )
-        print(
-            "  ||u_full_sub - u_partition_sub_raw||_2: "
-            f"min={local_err_norms_raw.min():.3e} "
-            f"max={local_err_norms_raw.max():.3e} "
-            f"avg={local_err_norms_raw.mean():.3e}"
-        )
-        print(
-            "  relative ||u_full_sub - u_partition_sub_raw||_2 / ||u_full_sub||_2: "
-            f"min={local_err_rel_raw.min():.3e} "
-            f"max={local_err_rel_raw.max():.3e} "
-            f"avg={local_err_rel_raw.mean():.3e}"
-        )
+        if solve_local:
+            print(
+                "  ||u_full_sub - u_partition_sub_raw||_2: "
+                f"min={local_err_norms_raw.min():.3e} "
+                f"max={local_err_norms_raw.max():.3e} "
+                f"avg={local_err_norms_raw.mean():.3e}"
+            )
+            print(
+                "  relative ||u_full_sub - u_partition_sub_raw||_2 / ||u_full_sub||_2: "
+                f"min={local_err_rel_raw.min():.3e} "
+                f"max={local_err_rel_raw.max():.3e} "
+                f"avg={local_err_rel_raw.mean():.3e}"
+            )
+        else:
+            print("  isolated local solves: SKIPPED (solve_local=False)")
         print(
             "  partition rhs norm ||rhs||_2: "
             f"min={rhs_norms.min():.3e} max={rhs_norms.max():.3e} avg={rhs_norms.mean():.3e}"
@@ -525,10 +560,11 @@ def solve_partition_domain(
             "  exterior dof fraction (per subdomain): "
             f"min={ext_frac.min():.3f} max={ext_frac.max():.3f} avg={ext_frac.mean():.3f}"
         )
-        print(
-            "  ||u_full - u_reconstructed_raw_partitions||_2: "
-            f"abs={full_error_raw_l2:.3e} rel={full_error_raw_rel_l2:.3e}"
-        )
+        if solve_local:
+            print(
+                "  ||u_full - u_reconstructed_raw_partitions||_2: "
+                f"abs={full_error_raw_l2:.3e} rel={full_error_raw_rel_l2:.3e}"
+            )
         print(
             "  reconstructed full-domain coverage: "
             f"covered={covered_count}/{n_global} "
@@ -537,20 +573,21 @@ def solve_partition_domain(
             f"max_overlap={max_overlap}"
         )
 
-        top_k = min(5, n_subdomains)
-        worst_ids = np.argsort(-local_err_rel_raw)[:top_k]
-        print("  worst subdomains by relative local error (raw):")
-        for wid in worst_ids:
-            sd = subdomains[int(wid)]
-            print(
-                f"    {sd['ijk']}: "
-                f"abs_err={sd['u3d_partition_error_local_raw_norm_l2']:.3e} "
-                f"rel_err={sd['u3d_partition_error_local_raw_rel_l2']:.3e} "
-                f"||rhs||={sd['partition_rhs_norm_l2']:.3e} "
-                f"||b0||={sd['partition_rhs_b0_norm_l2']:.3e} "
-                f"||cpl||={sd['partition_rhs_coupling_norm_l2']:.3e} "
-                f"skipped_q={sd['partition_skipped_q_vertices_count']}"
-            )
+        if solve_local:
+            top_k = min(5, n_subdomains)
+            worst_ids = np.argsort(-local_err_rel_raw)[:top_k]
+            print("  worst subdomains by relative local error (raw):")
+            for wid in worst_ids:
+                sd = subdomains[int(wid)]
+                print(
+                    f"    {sd['ijk']}: "
+                    f"abs_err={sd['u3d_partition_error_local_raw_norm_l2']:.3e} "
+                    f"rel_err={sd['u3d_partition_error_local_raw_rel_l2']:.3e} "
+                    f"||rhs||={sd['partition_rhs_norm_l2']:.3e} "
+                    f"||b0||={sd['partition_rhs_b0_norm_l2']:.3e} "
+                    f"||cpl||={sd['partition_rhs_coupling_norm_l2']:.3e} "
+                    f"skipped_q={sd['partition_skipped_q_vertices_count']}"
+                )
 
     return subdomains
 
@@ -564,6 +601,7 @@ def decomposeDomain(
     y_ROM_lenght=LENGTH_SUB,
     z_ROM_lenght=LENGTH_SUB,
     restrict_global_C=False,
+    solve_local=True,
 ):
     """Build the subdomains and solve each one in isolation.
 
@@ -574,6 +612,9 @@ def decomposeDomain(
 
         Robin_residual.apply_robin_residual  -- eqs. (4)-(5), one-shot
         Solve_schwarz_robin.solve_schwarz_robin -- iterative trace exchange
+
+    solve_local=False skips the isolated Neumann solve per box, keeping only the
+    assembly the schemes need. See solve_partition_domain.
     """
     V, Q = solver.W
     meshV = V.mesh()
@@ -845,6 +886,7 @@ def decomposeDomain(
     return solve_partition_domain(
         subdomains, solver, print_summary=True,
         restrict_global_C=restrict_global_C,
+        solve_local=solve_local,
     )
 
 
