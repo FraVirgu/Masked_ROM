@@ -43,10 +43,8 @@ LENGTH_SUB with DISCRETIZATION_POINT_SUB_DOMAIN cells per side):
 Boxes lying entirely outside the domain are not written (every field is
 zero there); they are listed in params.json under "empty_boxes".
 
-NOTE the global solve goes through /tmp/solution_raw.dat (Solver_full_domain),
-so two generator processes on the SAME machine would overwrite each other's
-solution. Run one process per node, or several nodes with -start/-n_cases
-splitting the index range.
+Several processes can run at once, on one machine or many: give each its own
+-start/-n_cases range so they never work on the same case.
 
 Run:
 

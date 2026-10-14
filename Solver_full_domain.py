@@ -1,5 +1,6 @@
 import time
 import os
+import tempfile
 import numpy as np
 from scipy.sparse import csr_matrix, save_npz
 from dolfin import *
@@ -702,8 +703,16 @@ class Solver3D1D:
         Chaz = haznics.create_matrix(csr2, csr1, csr0, C.shape[1])
         niters = haznics.fenics_metric_amg_solver(Ahaz, bhaz, xhaz, ADhaz, Mhaz, Chaz)
 
-        haznics.dvec_write("/tmp/solution_raw.dat", xhaz)
-        x_np = np.loadtxt("/tmp/solution_raw.dat", skiprows=1)
+        # A unique file per solve, not a fixed /tmp path: several jobs on one
+        # node (e.g. a SLURM array) would otherwise overwrite each other's
+        # solution between the write and the read.
+        fd, raw_path = tempfile.mkstemp(prefix="solution_raw_", suffix=".dat")
+        os.close(fd)
+        try:
+            haznics.dvec_write(raw_path, xhaz)
+            x_np = np.loadtxt(raw_path, skiprows=1)
+        finally:
+            os.remove(raw_path)
         return niters, xhaz, x_np
 
     def _require(self, *attrs):
