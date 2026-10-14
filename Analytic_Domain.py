@@ -8,6 +8,26 @@ from dolfin import (
 )
 from Boundary import Boundary, random_sphere_points
 
+# Seed points per unit volume of the Voronoi cloud. This is the density of the
+# original defaults -- 3 layers x 1690 points over [-1,1]^3 -- so a domain built
+# with points_per_layer_at_density() has the same vessel spacing as the
+# historical [-1,1]^3 runs, whatever the size of its box.
+REFERENCE_POINT_DENSITY = 3 * 1690 / 2.0 ** 3
+
+
+def points_per_layer_at_density(n_min, n_max, n_layers=3,
+                                density=REFERENCE_POINT_DENSITY):
+    """n_points_per_layer that fills the cube [n_min, n_max]^3 at `density`.
+
+    The cloud is scattered over the whole cube and only then cut to the
+    boundary, so the count has to follow the CUBE volume, not the domain's:
+    the points that land outside the domain are discarded, but they still
+    shape the Voronoi cells next to the wall.
+    """
+    volume = (float(n_max) - float(n_min)) ** 3
+    return max(1, int(round(density * volume / n_layers)))
+
+
 class Domain:
     """
     Represents an n-layer vascular network domain.
@@ -433,8 +453,12 @@ class Domain:
 
         nv = max(max(vert_list), len(vert_list)) + 1
         me.init_vertices(nv)
+        # Set, not list: this membership test runs once per Voronoi vertex, and
+        # against a list it is quadratic -- negligible on [-1,1]^3, hours once
+        # the cloud fills a domain-sized cube.
+        used = set(vert_list)
         for i in range(nv):
-            coord = vert_coord[i] if i in vert_list else [-666, -666, -666]
+            coord = vert_coord[i] if i in used else [-666, -666, -666]
             me.add_vertex(i, coord)
 
         me.init_cells(len(edges))

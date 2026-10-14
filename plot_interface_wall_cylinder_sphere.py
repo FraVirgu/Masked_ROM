@@ -35,7 +35,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-from Analytic_Domain import Domain
+from Analytic_Domain import Domain, points_per_layer_at_density
 from dolfin import Function, XDMFFile
 
 from Decompose_Domain_Analytic_cylinder_sphere import (
@@ -149,11 +149,23 @@ def main():
           f"{boundary.sphere_offset}  ->  background cube "
           f"[{n_min}, {n_max}]^3 at n={args.n}")
 
+    # The Voronoi cloud must span the same cube as the domain. Domain defaults
+    # to [-1,1]^3, which covers only the middle of the union: the cut to the
+    # boundary then leaves no network in the outer tube or the sphere lobe, and
+    # every inlet/outlet out there is wired in by one long straight edge to the
+    # nearest vertex inside [-1,1]^3. The point count follows the cube volume
+    # so the vessel spacing stays that of the original [-1,1]^3 runs.
+    n_per_layer = points_per_layer_at_density(n_min, n_max)
+    print(f"Voronoi cloud over [{n_min}, {n_max}]^3: "
+          f"{n_per_layer} points/layer x 3 layers")
     domain = Domain(
-        name            = name_stem,
-        n_vasi          = args.inlet,
-        n_ramifications = args.outlet,
-        boundary        = boundary,
+        name               = name_stem,
+        n_vasi             = args.inlet,
+        n_ramifications    = args.outlet,
+        n_min              = n_min,
+        n_max              = n_max,
+        n_points_per_layer = n_per_layer,
+        boundary           = boundary,
     ).build()
 
     domain.export_box()
