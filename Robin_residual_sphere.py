@@ -480,32 +480,44 @@ def apply_robin_residual(subdomains, solver, rho_robin=None, state=None,
     penalty = np.zeros(n_global, dtype=float)
     penalty[mask_cross] = 1.0 / np.maximum(mu_mult[mask_cross] - 1.0, 1.0)
 
-    mass_g = []
-    for sd in subdomains:
-        m = np.zeros(n_global, dtype=float)
-        m[sd["local_to_global_dof"]] = sd["_mass"]
-        mass_g.append(m)
+    # The sum over j != i is (sum over all j) - (box i's own term), so both
+    # sums are formed ONCE and each box subtracts itself. Algebraically
+    # identical to the pairwise double loop it replaces, which made
+    # O(N_sub^2) passes over n_global dofs -- ~46k full-vector passes at 216
+    # boxes, and the dominant cost of the whole run. Only rounding differs.
+    # Densities are kept box-local (over l2g) instead of one n_global vector
+    # per box, which at 216 boxes was ~3 GB of mostly zeros. Outside box j its
+    # mass is zero, so its density there was zero anyway.
+    def _local_density(sd):
+        l2g = sd["local_to_global_dof"]
+        m = np.asarray(sd["_mass"], dtype=float)
+        ok = mask_cross[l2g] & (m > 1e-30)
+        dens = np.zeros(l2g.size, dtype=float)
+        dens[ok] = sd["f_star_minus"][l2g[ok]] / m[ok]
+        return dens
 
-    for i, sd in enumerate(subdomains):
+    f_sum = np.zeros(n_global, dtype=float)
+    dens_sum = np.zeros(n_global, dtype=float)
+    for sd in subdomains:
+        f_sum += sd["f_star_minus"]
+        dens_sum[sd["local_to_global_dof"]] += _local_density(sd)
+
+    for sd in subdomains:
         l2g_i = sd["local_to_global_dof"]
+        f_i = sd["f_star_minus"]
         incoming = np.zeros(n_global, dtype=float)
 
-        for j, sd_j in enumerate(subdomains):
-            if j == i:
-                continue
-            f_j = subdomains[j]["f_star_minus"]
+        # plain faces: straight transfer on the connectivity set
+        incoming[mask_face] = f_sum[mask_face] - f_i[mask_face]
 
-            # plain faces: straight transfer on the connectivity set
-            incoming[mask_face] += f_j[mask_face]
-
-            # edges/corners: density in, box i's weighting out, share of the
-            # (mu - 1) contributing neighbours
-            ok = mask_cross & (mass_g[j] > 1e-30)
-            dens = np.zeros(n_global, dtype=float)
-            dens[ok] = f_j[ok] / mass_g[j][ok]
-            incoming[mask_cross] += (mass_g[i][mask_cross]
-                                     * dens[mask_cross]
-                                     * penalty[mask_cross])
+        # edges/corners: density in, box i's weighting out, share of the
+        # (mu - 1) contributing neighbours. Box i's mass is zero outside it,
+        # so only its own cross dofs receive anything.
+        c = mask_cross[l2g_i]
+        gi = l2g_i[c]
+        m_i = np.asarray(sd["_mass"], dtype=float)[c]
+        incoming[gi] = (m_i * penalty[gi]
+                        * (dens_sum[gi] - _local_density(sd)[c]))
 
         sd["_f_incoming"] = incoming
 
