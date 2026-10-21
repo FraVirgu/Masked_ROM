@@ -92,8 +92,21 @@ def reference_order(coords, length_sub, n_sub):
     return perm
 
 
-def iter_snapshots(boxes, fields, length_sub, n_sub, batch):
-    """Yield {field: (n_dofs, <=batch) array} blocks over every box."""
+def iter_snapshots(boxes, fields, length_sub, n_sub, batch, normalize):
+    """Yield ({field: (n_dofs, <=batch) array}, {field: raw norms}) blocks.
+
+    With `normalize`, every nonzero snapshot is scaled to unit norm, so each
+    box weighs the same in the POD regardless of its magnitude.
+    """
+    def flush(buf):
+        blk = {f: np.stack(v, axis=1) for f, v in buf.items()}
+        nrm = {f: np.linalg.norm(S, axis=0) for f, S in blk.items()}
+        if normalize:
+            for f, S in blk.items():
+                ok = nrm[f] > ZERO_NORM
+                S[:, ok] /= nrm[f][ok]
+        return blk, nrm
+
     buf = {f: [] for f in fields}
     for path in boxes:
         with np.load(path) as b:
@@ -101,10 +114,36 @@ def iter_snapshots(boxes, fields, length_sub, n_sub, batch):
             for f in fields:
                 buf[f].append(np.asarray(FIELDS[f](b), dtype=float)[perm])
         if len(buf[fields[0]]) == batch:
-            yield {f: np.stack(v, axis=1) for f, v in buf.items()}
+            yield flush(buf)
             buf = {f: [] for f in fields}
     if buf[fields[0]]:
-        yield {f: np.stack(v, axis=1) for f, v in buf.items()}
+        yield flush(buf)
+
+
+def report_norms(boxes, norms, top):
+    """Spread of the per-box norms, and the cases holding the largest ones.
+
+    A few boxes many orders of magnitude above the rest own the whole POD:
+    sigma collapses after ~their count and every other box sits under the
+    precision floor. This is the first thing to look at.
+    """
+    case_of = np.array([os.path.basename(os.path.dirname(os.path.dirname(p)))
+                        for p in boxes])
+    for f, nrm in norms.items():
+        nz = nrm[nrm > ZERO_NORM]
+        print(f"\n[{f}] box norms: min {nz.min():.3e}  median "
+              f"{np.median(nz):.3e}  p99 {np.percentile(nz, 99):.3e}  "
+              f"max {nz.max():.3e}   ({len(nrm) - len(nz)} zero boxes)")
+        energy = nrm ** 2 / np.sum(nrm ** 2)
+        print(f"  {'case':<12} {'boxes':>6} {'max norm':>11} "
+              f"{'median norm':>12} {'energy share':>13}")
+        per_case = []
+        for c in np.unique(case_of):
+            m = case_of == c
+            per_case.append((c, m.sum(), nrm[m].max(), np.median(nrm[m]),
+                             energy[m].sum()))
+        for c, k, mx, md, e in sorted(per_case, key=lambda r: -r[4])[:top]:
+            print(f"  {c:<12} {k:6d} {mx:11.3e} {md:12.3e} {e:13.2%}")
 
 
 # =============================================================================
@@ -145,10 +184,21 @@ def main():
                         help="boxes per block in the S S^T accumulation")
     parser.add_argument("-tols", nargs="+", type=float,
                         default=[1e-1, 1e-2, 1e-3, 1e-4])
+    parser.add_argument("-normalize", action="store_true",
+                        help="POD of s/||s||: every box weighs the same")
+    parser.add_argument("-exclude", nargs="+", default=[],
+                        help="case folder names to leave out, e.g. case_00042")
+    parser.add_argument("-top", type=int, default=10,
+                        help="cases listed in the norm report")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     cases, boxes = list_boxes(args.data)
+    skip = set(args.exclude)
+    cases = [c for c in cases if os.path.basename(c) not in skip]
+    boxes = [b for b in boxes
+             if os.path.basename(os.path.dirname(os.path.dirname(b)))
+             not in skip]
     if not boxes:
         raise SystemExit(f"no finished case with boxes under {args.data}")
     with open(os.path.join(cases[0], "params.json")) as f:
@@ -160,13 +210,17 @@ def main():
     # ---- pass 1: correlation matrices --------------------------------------
     t0 = time.time()
     C = {f: np.zeros((n, n)) for f in args.fields}
+    norms = {f: [] for f in args.fields}
     done = 0
-    for blk in iter_snapshots(boxes, args.fields, length_sub, n_sub,
-                              args.batch):
+    for blk, nrm in iter_snapshots(boxes, args.fields, length_sub, n_sub,
+                                   args.batch, args.normalize):
         for f in args.fields:
             C[f] += blk[f] @ blk[f].T
+            norms[f].append(nrm[f])
         done += blk[args.fields[0]].shape[1]
         print(f"  pass 1: {done}/{len(boxes)} boxes  ({time.time() - t0:.0f}s)")
+    norms = {f: np.concatenate(v) for f, v in norms.items()}
+    report_norms(boxes, norms, args.top)
 
     rmax = min(args.rmax, n, len(boxes))
     sigma, basis = {}, {}
@@ -184,8 +238,8 @@ def main():
     sq_err = {f: np.zeros(rmax + 1) for f in args.fields}
     sq_norm = {f: 0.0 for f in args.fields}
     done = 0
-    for blk in iter_snapshots(boxes, args.fields, length_sub, n_sub,
-                              args.batch):
+    for blk, _ in iter_snapshots(boxes, args.fields, length_sub, n_sub,
+                                 args.batch, args.normalize):
         for f in args.fields:
             S = blk[f]
             nrm2 = np.einsum("ij,ij->j", S, S)
@@ -202,7 +256,8 @@ def main():
 
     # ---- summary ------------------------------------------------------------
     out = {"n_cases": len(cases), "n_boxes": len(boxes), "n_dofs": n,
-           "rmax": rmax}
+           "rmax": rmax, "normalize": args.normalize,
+           "excluded": np.array(sorted(skip), dtype=str)}
     summary = {}
     for f in args.fields:
         R = np.vstack(rel[f])
@@ -233,7 +288,8 @@ def main():
     np.savez_compressed(os.path.join(args.out, "pod_analysis.npz"), **out)
     with open(os.path.join(args.out, "summary.json"), "w") as fh:
         json.dump(dict(n_cases=len(cases), n_boxes=len(boxes), n_dofs=n,
-                       rmax=rmax, fields=summary), fh, indent=2)
+                       rmax=rmax, normalize=args.normalize,
+                       excluded=sorted(skip), fields=summary), fh, indent=2)
 
     print(f"\n{len(cases)} cases, {len(boxes)} boxes, n = {n}, rmax = {rmax}")
     for f in args.fields:
@@ -277,7 +333,8 @@ def plot(out, fields, rmax, out_dir):
         for side in ("top", "right"):
             a.spines[side].set_visible(False)
     fig.suptitle(f"{out['n_cases']} cases, {out['n_boxes']} boxes, "
-                 f"{out['n_dofs']} dofs per box")
+                 f"{out['n_dofs']} dofs per box"
+                 + (", normalised snapshots" if out["normalize"] else ""))
     fig.tight_layout()
     path = os.path.join(out_dir, "pod_analysis.png")
     fig.savefig(path, dpi=150)
