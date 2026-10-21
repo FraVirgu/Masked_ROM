@@ -68,10 +68,27 @@ FLOOR = 1e-7
 # dataset traversal
 # =============================================================================
 
+def solve_failed(case_dir):
+    """True if the global solve did not converge.
+
+    haznics returns a negative hazmath error code instead of an iteration
+    count (e.g. -48 = ERROR_SOLVER_MAXIT); u_star is then the last iterate,
+    possibly blown up to ~1e14, and a single such case owns the whole POD.
+    """
+    with open(os.path.join(case_dir, "params.json")) as f:
+        iters = json.load(f).get("solver_iters")
+    return iters is not None and iters < 0
+
+
 def list_boxes(data_dir):
-    """All box files of all finished cases, sorted for reproducibility."""
+    """All box files of all finished, converged cases, sorted."""
     cases = sorted(d for d in glob.glob(os.path.join(data_dir, "case_*"))
                    if os.path.isfile(os.path.join(d, "done")))
+    failed = [c for c in cases if solve_failed(c)]
+    if failed:
+        print(f"skipping {len(failed)} cases whose global solve did not "
+              f"converge: {' '.join(os.path.basename(c) for c in failed)}")
+    cases = [c for c in cases if c not in failed]
     boxes = []
     for c in cases:
         boxes += sorted(glob.glob(os.path.join(c, "subdomains", "box_*.npz")))
